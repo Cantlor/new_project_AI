@@ -1,0 +1,28 @@
+{
+  "schema_name": "module_name.summary",
+  "schema_version": "v1",
+  "module_name": "module_name",
+  "data_contract_version": "v1",
+  "run_id": "YYYYMMDD_HHMMSS_example",
+  "created_at_utc": "2026-03-27T00:00:00Z",
+  "status": "success",
+  "headline": "Краткое техническое резюме run",
+  "key_context": {
+    "source_run_ids": [],
+    "feature_mode": null,
+    "assembled_model_input": null,
+    "device_resolved": null,
+    "amp_used": null
+  },
+  "result": {
+    "primary_outputs": [],
+    "main_metrics": {},
+    "counts": {},
+    "notes": []
+  },
+  "diagnostics": {
+    "warnings": [],
+    "errors": []
+  },
+  "next_steps": []
+}

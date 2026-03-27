@@ -1,0 +1,116 @@
+{
+  "schema_name": "module_name.artifact_name",
+  "schema_version": "v1",
+  "module_name": "module_name",
+  "module_version": null,
+  "data_contract_version": "v1",
+  "run_id": "YYYYMMDD_HHMMSS_example",
+  "stage_name": null,
+  "created_at_utc": "2026-03-27T00:00:00Z",
+  "status": "success",
+  "config": {
+    "config_used_path": "path/to/config_used.yaml",
+    "config_hash": null,
+    "config_overrides": null
+  },
+  "provenance": {
+    "source_run_ids": [],
+    "source_manifest_paths": [],
+    "source_config_paths": [],
+    "code_version": null,
+    "git_commit": null
+  },
+  "inputs": {
+    "artifacts": [
+      {
+        "path": "path/to/input_artifact",
+        "role": "input_role",
+        "format": "GeoTIFF",
+        "is_required": true,
+        "exists": true,
+        "checksum": null,
+        "size_bytes": null,
+        "crs": null,
+        "transform": null,
+        "width": null,
+        "height": null,
+        "count": null,
+        "dtype": null,
+        "nodata": null,
+        "channel_semantics": null,
+        "notes": []
+      }
+    ]
+  },
+  "outputs": {
+    "artifacts": [
+      {
+        "path": "path/to/output_artifact",
+        "role": "output_role",
+        "format": "GeoTIFF",
+        "is_required": true,
+        "exists": true,
+        "checksum": null,
+        "size_bytes": null,
+        "crs": null,
+        "transform": null,
+        "width": null,
+        "height": null,
+        "count": null,
+        "dtype": null,
+        "nodata": null,
+        "channel_semantics": null,
+        "notes": []
+      }
+    ]
+  },
+  "resolved_contract": {
+    "spatial": {
+      "reference_grid_source": null,
+      "reference_crs": null,
+      "reference_resolution": null,
+      "alignment_policy": null,
+      "aoi_used": false,
+      "aoi_buffer_m": null
+    },
+    "features": {
+      "dataset_feature_mode": null,
+      "assembled_model_input": null,
+      "feature_channel_count": null,
+      "final_input_channel_count": null,
+      "channel_semantics": [],
+      "valid_as_input_channel": null
+    },
+    "valid_policy": {
+      "valid_source": null,
+      "valid_representation": null,
+      "invalid_handling": null,
+      "nodata_policy": null
+    },
+    "normalization": {
+      "dtype_before_model": null,
+      "normalization_name": null,
+      "stats_source": null,
+      "clip_percentiles": null,
+      "scaling_range": null
+    },
+    "aoi_policy": {
+      "aoi_present": false,
+      "aoi_role": null,
+      "buffer_m": null,
+      "output_extent_mode": null
+    }
+  },
+  "runtime": {
+    "device_requested": null,
+    "device_resolved": null,
+    "amp_requested": null,
+    "amp_used": null,
+    "oom_fallbacks_applied": [],
+    "notes": []
+  },
+  "diagnostics": {
+    "warnings": [],
+    "errors": []
+  }
+}
