@@ -96,6 +96,9 @@ class AoiConfig:
     aoi_path: Optional[str] = None
     buffer_m: float = 30.0
     """Context buffer around AOI in metres (baseline 30 m, main_tech.md §8)."""
+    derive_from_labels_if_missing: bool = False
+    """Auto-derive AOI from buffered bbox of label polygons when no aoi_path is given.
+    Opt-in only; defaults to False.  Incompatible with enabled=True."""
 
     def validate(self) -> None:
         """Raise ContractError if the AOI config is invalid."""
@@ -121,6 +124,17 @@ class AoiConfig:
             raise ContractError(
                 "aoi.enabled is True but aoi.aoi_path is null.  "
                 "Provide a path to the AOI file."
+            )
+        if not isinstance(self.derive_from_labels_if_missing, bool):
+            raise ContractError(
+                "aoi.derive_from_labels_if_missing must be a boolean, "
+                f"got {type(self.derive_from_labels_if_missing).__name__}."
+            )
+        if self.derive_from_labels_if_missing and self.enabled:
+            raise ContractError(
+                "aoi.derive_from_labels_if_missing and aoi.enabled=True cannot both be set: "
+                "use enabled=True with an explicit aoi_path for user-provided AOI, or "
+                "derive_from_labels_if_missing=True (without enabled) for auto-derived AOI."
             )
 
 

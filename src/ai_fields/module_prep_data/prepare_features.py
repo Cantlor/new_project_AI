@@ -8,6 +8,7 @@ tensor assembly, or normalization execution.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from typing import Any, Literal
 
 from ai_fields.common.constants import CHANNEL_COUNTS, DATA_CONTRACT_VERSION, DERIVED_INDICES
 from ai_fields.common.errors import ContractError
-from ai_fields.common.manifests import write_manifest, write_summary
+from ai_fields.common.manifests import read_manifest, write_manifest, write_summary
 from ai_fields.module_prep_data import config as prep_data_config
 from ai_fields.module_prep_data.schemas import PrepDataConfig
 
@@ -39,6 +40,9 @@ _FEATURE_MODE_TO_ASSEMBLED_VARIANT = {
     "raw8": "raw8_valid",
     "raw8_idx3": "raw8_idx3_valid",
 }
+_SPATIAL_CONTEXT_SCHEMA_NAME = "prep_data.aoi_manifest"
+_SPATIAL_MODE_FULL_RASTER = "full_raster"
+_SPATIAL_MODE_AOI_LIMITED = "aoi_limited"
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,140 @@ def _normalize_optional_path(name: str, value: Any | None) -> str | None:
 def _now_utc_iso() -> str:
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     return ts.replace("+00:00", "Z")
+
+
+def _extract_numeric_bounds(name: str, raw_bounds: Any) -> list[float] | None:
+    if raw_bounds is None:
+        return None
+    if isinstance(raw_bounds, (str, bytes)) or not isinstance(raw_bounds, Sequence):
+        raise ContractError(f"{name} must be a 4-element numeric sequence or null.")
+    if len(raw_bounds) != 4:
+        raise ContractError(f"{name} must have length 4, got {len(raw_bounds)}.")
+
+    out: list[float] = []
+    for idx, value in enumerate(raw_bounds):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ContractError(
+                f"{name}[{idx}] must be a number, got {value!r} ({type(value).__name__})."
+            )
+        as_float = float(value)
+        if not math.isfinite(as_float):
+            raise ContractError(f"{name}[{idx}] must be finite, got {value!r}.")
+        out.append(as_float)
+    if out[0] >= out[2] or out[1] >= out[3]:
+        raise ContractError(
+            f"{name} must satisfy minx < maxx and miny < maxy, got {out}."
+        )
+    return out
+
+
+def _load_bounds_from_aoi_artifact(aoi_output_path: str | Path) -> list[float]:
+    try:
+        import geopandas as gpd  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover
+        raise ContractError(
+            "AOI-limited stage-02 context requires geopandas to recover bounds from aoi_output_path."
+        ) from exc
+
+    artifact_path = _normalize_path("aoi_output_path", aoi_output_path)
+    if not artifact_path.exists():
+        raise ContractError(f"aoi_output_path does not exist: {artifact_path}")
+    if not artifact_path.is_file():
+        raise ContractError(f"aoi_output_path is not a regular file: {artifact_path}")
+
+    try:
+        aoi_gdf = gpd.read_file(artifact_path)
+    except Exception as exc:
+        raise ContractError(
+            f"Failed to read aoi_output_path for stage-03 spatial context: {exc}"
+        ) from exc
+
+    try:
+        bounds = [float(v) for v in aoi_gdf.total_bounds]
+    except Exception as exc:
+        raise ContractError(
+            f"Failed to extract bounds from aoi_output_path '{artifact_path}': {exc}"
+        ) from exc
+
+    if len(bounds) != 4 or not all(math.isfinite(v) for v in bounds):
+        raise ContractError(
+            "aoi_output_path bounds are empty/non-finite; cannot resolve AOI-limited extent."
+        )
+    if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+        raise ContractError(
+            f"aoi_output_path bounds are invalid/non-positive: {bounds}."
+        )
+    return bounds
+
+
+def _extract_stage02_spatial_context(source_manifest_path: str | None) -> dict[str, Any]:
+    if source_manifest_path is None:
+        return {
+            "spatial_context_mode": _SPATIAL_MODE_FULL_RASTER,
+            "effective_extent_bounds": None,
+            "bounds_source": None,
+            "manifest_consumed": False,
+        }
+
+    manifest = read_manifest(source_manifest_path)
+    if manifest.get("schema_name") != _SPATIAL_CONTEXT_SCHEMA_NAME:
+        return {
+            "spatial_context_mode": _SPATIAL_MODE_FULL_RASTER,
+            "effective_extent_bounds": None,
+            "bounds_source": None,
+            "manifest_consumed": False,
+        }
+
+    spatial_block = manifest.get("resolved_contract", {}).get("spatial", {})
+    mode = manifest.get("spatial_context_mode")
+    if mode is None:
+        mode = spatial_block.get("spatial_context_mode")
+    if mode not in {_SPATIAL_MODE_FULL_RASTER, _SPATIAL_MODE_AOI_LIMITED}:
+        raise ContractError(
+            "Stage-02 source manifest has invalid spatial_context_mode. "
+            f"Expected one of [{_SPATIAL_MODE_FULL_RASTER!r}, {_SPATIAL_MODE_AOI_LIMITED!r}], got {mode!r}."
+        )
+
+    if mode == _SPATIAL_MODE_FULL_RASTER:
+        return {
+            "spatial_context_mode": _SPATIAL_MODE_FULL_RASTER,
+            "effective_extent_bounds": None,
+            "bounds_source": None,
+            "manifest_consumed": True,
+        }
+
+    bounds = _extract_numeric_bounds(
+        "stage02.effective_extent_bounds",
+        manifest.get("effective_extent_bounds"),
+    )
+    if bounds is None:
+        bounds = _extract_numeric_bounds(
+            "stage02.resolved_contract.spatial.effective_extent_bounds",
+            spatial_block.get("effective_extent_bounds"),
+        )
+    if bounds is not None:
+        return {
+            "spatial_context_mode": _SPATIAL_MODE_AOI_LIMITED,
+            "effective_extent_bounds": bounds,
+            "bounds_source": "effective_extent_bounds",
+            "manifest_consumed": True,
+        }
+
+    aoi_output_path = manifest.get("aoi_output_path")
+    if aoi_output_path is None:
+        aoi_output_path = spatial_block.get("aoi_output_path")
+    if isinstance(aoi_output_path, str) and aoi_output_path.strip() != "":
+        return {
+            "spatial_context_mode": _SPATIAL_MODE_AOI_LIMITED,
+            "effective_extent_bounds": _load_bounds_from_aoi_artifact(aoi_output_path),
+            "bounds_source": "aoi_output_path",
+            "manifest_consumed": True,
+        }
+
+    raise ContractError(
+        "Stage-02 manifest declares spatial_context_mode='aoi_limited' but does not provide "
+        "usable effective_extent_bounds or aoi_output_path for stage-03 runtime consumption."
+    )
 
 
 def _resolve_config(
@@ -320,6 +458,10 @@ def run_prepare_features_stage(
     img_output_path: str | None = None
     valid_output_path: str | None = None
     features_compute_mode: str | None = None
+    spatial_context_mode: str = _SPATIAL_MODE_FULL_RASTER
+    spatial_context_bounds_used: list[float] | None = None
+    spatial_context_bounds_source: str | None = None
+    spatial_context_manifest_consumed = False
 
     try:
         input_raster_path = _normalize_optional_path("raster_path", raster_path)
@@ -328,6 +470,16 @@ def run_prepare_features_stage(
             normalized_source_manifest_path = str(
                 _normalize_path("source_manifest_path", source_manifest_path)
             )
+            if runtime_compute_enabled:
+                resolved_spatial_context = _extract_stage02_spatial_context(
+                    normalized_source_manifest_path
+                )
+                spatial_context_mode = resolved_spatial_context["spatial_context_mode"]
+                spatial_context_bounds_used = resolved_spatial_context["effective_extent_bounds"]
+                spatial_context_bounds_source = resolved_spatial_context["bounds_source"]
+                spatial_context_manifest_consumed = bool(
+                    resolved_spatial_context["manifest_consumed"]
+                )
 
         resolved_config, config_used_path = _resolve_config(config=config, config_path=config_path)
         resolved = _resolve_feature_contract(
@@ -359,12 +511,21 @@ def run_prepare_features_stage(
                 raster_path=raster_path,
                 output_dir=output_root,
                 feature_mode=feature_mode,
+                processing_bounds=(
+                    spatial_context_bounds_used
+                    if spatial_context_mode == _SPATIAL_MODE_AOI_LIMITED
+                    else None
+                ),
             )
             img_output_path = str(compute_result["img_path"])
             valid_output_path = str(compute_result["valid_path"])
             feature_channel_count = compute_result["feature_channel_count"]
             channel_semantics = list(compute_result["channel_semantics"])
             features_compute_mode = compute_result["features_compute_mode"]
+            if compute_result.get("processing_bounds_applied") is not None:
+                spatial_context_bounds_used = [
+                    float(v) for v in compute_result["processing_bounds_applied"]
+                ]
 
         status = "success"
         checks = _build_success_checks(
@@ -400,6 +561,9 @@ def run_prepare_features_stage(
             ),
             "runtime_compute_enabled": runtime_compute_enabled,
             "features_compute_mode": features_compute_mode,
+            "spatial_context_mode": spatial_context_mode,
+            "spatial_context_manifest_consumed": spatial_context_manifest_consumed,
+            "spatial_context_bounds_source": spatial_context_bounds_source,
         },
         "provenance": {
             "source_run_ids": [],
@@ -413,7 +577,12 @@ def run_prepare_features_stage(
         "inputs": {"artifacts": []},
         "outputs": {"artifacts": []},
         "resolved_contract": {
-            "spatial": {},
+            "spatial": {
+                "spatial_context_mode": spatial_context_mode,
+                "effective_extent_bounds_used": spatial_context_bounds_used,
+                "effective_extent_bounds_source": spatial_context_bounds_source,
+                "source_manifest_consumed": spatial_context_manifest_consumed,
+            },
             "features": {
                 "feature_mode": feature_mode,
                 "feature_channel_count": feature_channel_count,
@@ -449,6 +618,9 @@ def run_prepare_features_stage(
         "valid_saved_separately": valid_saved_separately,
         "assembled_model_input_variants": assembled_variants if assembled_variants is not None else [],
         "normalization_plan": normalization_plan,
+        "spatial_context_mode": spatial_context_mode,
+        "effective_extent_bounds_used": spatial_context_bounds_used,
+        "effective_extent_bounds_source": spatial_context_bounds_source,
         "checks": checks,
         "diagnostics": {
             "warnings": [],
@@ -469,6 +641,9 @@ def run_prepare_features_stage(
         "assembled_model_input_variants": assembled_variants,
         "channel_semantics_resolved": channel_semantics_resolved,
         "feature_metadata_consistent": checks["feature_metadata_consistent"],
+        "spatial_context_mode": spatial_context_mode,
+        "effective_extent_bounds_used": spatial_context_bounds_used,
+        "effective_extent_bounds_source": spatial_context_bounds_source,
         "source_manifest_path": normalized_source_manifest_path,
         "blocking_issues": blocking_issues,
         "manifest_path": str(manifest_path),

@@ -59,6 +59,8 @@ class PrepareSpatialContextStageResult:
     # without re-reading the manifest JSON.
     aoi_output_path: Path | None = None
     effective_extent_bounds: tuple[float, float, float, float] | None = None
+    aoi_source_type: str | None = None  # "user_provided" | "derived_from_labels" | None
+    aoi_derivation_method: str | None = None  # "labels_bbox_buffered" | None
 
     @property
     def success(self) -> bool:
@@ -191,7 +193,12 @@ def _resolve_spatial_contract(
             metadata_name="aoi_metadata",
         )
 
-    buffer_m = float(resolved_config.aoi.buffer_m) if aoi_present else None
+    derive_aoi_from_labels_if_missing = bool(resolved_config.aoi.derive_from_labels_if_missing)
+    buffer_m = (
+        float(resolved_config.aoi.buffer_m)
+        if aoi_present or derive_aoi_from_labels_if_missing
+        else None
+    )
     # `bounds` from metadata is treated as a hint only in this lightweight stage.
     aoi_bounds_metadata_hint = _extract_aoi_bounds_metadata_hint(aoi_metadata)
     # No real spatial clipping/reprojection is executed here, so no computed
@@ -206,6 +213,7 @@ def _resolve_spatial_contract(
         "crs_summary": crs_summary,
         "aoi_present": aoi_present,
         "aoi_policy_enabled": aoi_policy_enabled,
+        "derive_aoi_from_labels_if_missing": derive_aoi_from_labels_if_missing,
         "buffer_m": buffer_m,
         "aoi_bounds_metadata_hint": aoi_bounds_metadata_hint,
         "effective_extent_bounds": effective_bounds,
@@ -301,6 +309,9 @@ def run_prepare_spatial_context_stage(
     normalized_source_manifest_path: str | None = None
     spatial_compute_mode: str | None = None
     aoi_reprojected: bool | None = None
+    aoi_source_type: str | None = None
+    aoi_derivation_method: str | None = None
+    derive_aoi_from_labels_if_missing = False
 
     try:
         if source_manifest_path is not None:
@@ -320,7 +331,10 @@ def run_prepare_spatial_context_stage(
         spatial_context_mode = spatial["spatial_context_mode"]
         aoi_present = spatial["aoi_present"]
         aoi_policy_enabled = spatial["aoi_policy_enabled"]
+        derive_aoi_from_labels_if_missing = bool(spatial["derive_aoi_from_labels_if_missing"])
         resolved_buffer_m = spatial["buffer_m"]
+        if aoi_present:
+            aoi_source_type = "user_provided"
         vector_source_crs = spatial["crs_summary"]["vector_crs"]
         vector_target_crs = spatial["crs_summary"]["raster_crs"]
         vector_reprojection_required = bool(
@@ -346,17 +360,28 @@ def run_prepare_spatial_context_stage(
                 aoi_path=aoi_path,
                 buffer_m=float(resolved_buffer_m) if resolved_buffer_m is not None else 0.0,
                 output_dir=output_root,
+                derive_aoi_from_labels=derive_aoi_from_labels_if_missing,
             )
             effective_extent_bounds = compute_result["effective_extent_bounds"]
             vector_reprojected = compute_result["vector_reprojected"]
             vector_output_path = compute_result.get("vector_reprojected_path")
             aoi_reprojected = compute_result["aoi_reprojected"]
             aoi_output_path = compute_result.get("aoi_reprojected_path")
+            aoi_derivation_method = compute_result.get("aoi_derivation_method")
             spatial_compute_mode = compute_result["spatial_compute_mode"]
             vector_source_crs = compute_result.get("vector_crs_source") or vector_source_crs
             vector_target_crs = compute_result["raster_crs"]
             aoi_source_crs = compute_result.get("aoi_crs_source") or aoi_source_crs
             aoi_target_crs = compute_result["raster_crs"]
+            resolved_aoi_source_type = compute_result.get("aoi_source_type")
+            if resolved_aoi_source_type in {"user_provided", "derived_from_labels"}:
+                aoi_source_type = resolved_aoi_source_type
+            if aoi_source_type == "derived_from_labels":
+                aoi_present = True
+                spatial_context_mode = "aoi_limited"
+
+        if aoi_source_type is None and aoi_present:
+            aoi_source_type = "user_provided"
 
         status = "success"
         checks = _build_success_checks()
@@ -385,6 +410,11 @@ def run_prepare_spatial_context_stage(
             "input_refs_source": _INPUT_REFS_SOURCE,
             "aoi_policy_enabled": None if resolved_config is None else resolved_config.aoi.enabled,
             "aoi_policy_buffer_m": None if resolved_config is None else float(resolved_config.aoi.buffer_m),
+            "aoi_derive_from_labels_if_missing": (
+                None
+                if resolved_config is None
+                else bool(resolved_config.aoi.derive_from_labels_if_missing)
+            ),
             "feature_mode": None if resolved_config is None else resolved_config.feature_mode,
             "runtime_compute_enabled": runtime_compute_enabled,
             "spatial_compute_mode": spatial_compute_mode,
@@ -410,7 +440,11 @@ def run_prepare_spatial_context_stage(
                         "crs": aoi_source_crs,
                     }
                 ]
-                if runtime_compute_enabled and aoi_path is not None
+                if (
+                    runtime_compute_enabled
+                    and aoi_path is not None
+                    and aoi_source_type == "user_provided"
+                )
                 else []
             )
         },
@@ -434,7 +468,11 @@ def run_prepare_spatial_context_stage(
                         [
                             {
                                 "path": aoi_output_path,
-                                "role": "aoi_resolved_in_raster_crs",
+                                "role": (
+                                    "aoi_derived_from_labels_in_raster_crs"
+                                    if aoi_source_type == "derived_from_labels"
+                                    else "aoi_resolved_in_raster_crs"
+                                ),
                                 "format": "GPKG",
                                 "is_required": False,
                                 "exists": True,
@@ -464,6 +502,8 @@ def run_prepare_spatial_context_stage(
                 "aoi_target_crs": aoi_target_crs,
                 "aoi_reprojection_required": aoi_reprojection_required,
                 "aoi_reprojection_applied": aoi_reprojected,
+                "aoi_source_type": aoi_source_type,
+                "aoi_derivation_method": aoi_derivation_method,
                 "aoi_output_path": aoi_output_path,
                 "aoi_bounds_metadata_hint": aoi_bounds_metadata_hint,
                 "effective_extent_bounds": effective_extent_bounds,
@@ -474,6 +514,7 @@ def run_prepare_spatial_context_stage(
             "aoi_policy": {
                 "enabled": aoi_policy_enabled,
                 "buffer_m": resolved_buffer_m,
+                "derive_from_labels_if_missing": derive_aoi_from_labels_if_missing,
             },
         },
         "runtime": {
@@ -486,6 +527,8 @@ def run_prepare_spatial_context_stage(
         },
         "aoi_present": aoi_present if aoi_present is not None else (aoi_path is not None),
         "aoi_source_path": _safe_path_str(aoi_path),
+        "aoi_source_type": aoi_source_type,
+        "aoi_derivation_method": aoi_derivation_method,
         "aoi_source_crs": aoi_source_crs,
         "aoi_target_crs": aoi_target_crs,
         "aoi_reprojected": aoi_reprojected,
@@ -528,6 +571,8 @@ def run_prepare_spatial_context_stage(
         "aoi_present": aoi_present,
         "aoi_policy_enabled": aoi_policy_enabled,
         "buffer_m": resolved_buffer_m,
+        "aoi_source_type": aoi_source_type,
+        "aoi_derivation_method": aoi_derivation_method,
         "source_manifest_path": normalized_source_manifest_path,
         "blocking_issues": blocking_issues,
         "manifest_path": str(manifest_path),
@@ -553,4 +598,6 @@ def run_prepare_spatial_context_stage(
             if effective_extent_bounds
             else None
         ),
+        aoi_source_type=aoi_source_type,
+        aoi_derivation_method=aoi_derivation_method,
     )

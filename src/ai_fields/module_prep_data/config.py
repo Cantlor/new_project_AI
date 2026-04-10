@@ -225,7 +225,7 @@ def _build_aoi(d: Optional[Dict[str, Any]]) -> AoiConfig:
     if d is None:
         return AoiConfig()
     d = _ensure_section_mapping("aoi", d)
-    unknown = set(d) - {"enabled", "aoi_path", "buffer_m"}
+    unknown = set(d) - {"enabled", "aoi_path", "buffer_m", "derive_from_labels_if_missing"}
     if unknown:
         warnings.warn(
             f"Unknown keys in aoi section: {_sorted_unknown_keys(unknown)}.  "
@@ -241,6 +241,9 @@ def _build_aoi(d: Optional[Dict[str, Any]]) -> AoiConfig:
         enabled=_get_bool("aoi", d, "enabled", False),
         aoi_path=aoi_path,
         buffer_m=_get_float("aoi", d, "buffer_m", 30.0),
+        derive_from_labels_if_missing=_get_bool(
+            "aoi", d, "derive_from_labels_if_missing", False
+        ),
     )
 
 

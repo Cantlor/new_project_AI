@@ -7,6 +7,7 @@ so the stage runner can return status="failed".
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +16,34 @@ from ai_fields.common.errors import ContractError
 SPATIAL_COMPUTE_MODE = "rasterio_geopandas_v1"
 
 
+def _bounds_are_finite(bounds: list[float]) -> bool:
+    return len(bounds) == 4 and all(math.isfinite(v) for v in bounds)
+
+
+def _clamp_bounds_to_raster(
+    *,
+    raw_bounds: list[float],
+    raster_bounds: list[float],
+) -> list[float]:
+    minx = max(float(raw_bounds[0]), float(raster_bounds[0]))
+    miny = max(float(raw_bounds[1]), float(raster_bounds[1]))
+    maxx = min(float(raw_bounds[2]), float(raster_bounds[2]))
+    maxy = min(float(raw_bounds[3]), float(raster_bounds[3]))
+    if minx >= maxx or miny >= maxy:
+        raise ContractError(
+            "Derived AOI does not intersect raster extent after clamping; "
+            "cannot resolve non-empty effective extent."
+        )
+    return [minx, miny, maxx, maxy]
+
+
 def compute_spatial_context(
     raster_path: Any,
     vector_path: Any,
     aoi_path: Any | None,
     buffer_m: float,
     output_dir: Any | None = None,
+    derive_aoi_from_labels: bool = False,
 ) -> dict:
     """Compute spatial context from real files.
 
@@ -35,13 +58,16 @@ def compute_spatial_context(
         from buffered + dissolved AOI bounds reprojected to raster CRS.
     buffer_m:
         Buffer in metres to apply around the AOI geometry.
+    derive_aoi_from_labels:
+        When True and aoi_path is None, auto-derive AOI from the buffered bbox
+        of reprojected label polygons.  Writes aoi_derived_from_labels.gpkg.
 
     Returns
     -------
     dict with keys:
         raster_crs, vector_crs, vector_crs_source, vector_reprojected,
         vector_reprojected_path, aoi_crs, aoi_crs_source, aoi_reprojected,
-        aoi_reprojected_path,
+        aoi_reprojected_path, aoi_source_type, aoi_derivation_method,
         effective_extent_bounds, raster_bounds, raster_width, raster_height,
         spatial_compute_mode
     """
@@ -130,9 +156,12 @@ def compute_spatial_context(
     aoi_crs_source: str | None = None
     aoi_reprojected: bool | None = None
     aoi_reprojected_path: str | None = None
+    aoi_source_type: str | None = None
+    aoi_derivation_method: str | None = None
     effective_extent_bounds: list[float]
 
     if aoi_path is not None:
+        aoi_source_type = "user_provided"
         aoi_path = Path(aoi_path)
         if not aoi_path.exists():
             raise ContractError(f"AOI file does not exist: {aoi_path}")
@@ -201,6 +230,44 @@ def compute_spatial_context(
             raise ContractError(
                 f"Failed to compute effective extent from AOI buffer: {exc}"
             ) from exc
+    elif derive_aoi_from_labels:
+        # Derive AOI from buffered bbox of reprojected label polygons.
+        from shapely.geometry import box as shapely_box  # noqa: PLC0415
+
+        total_bounds = [float(v) for v in vec_reproj.total_bounds]  # [minx, miny, maxx, maxy]
+        if not _bounds_are_finite(total_bounds):
+            raise ContractError(
+                "Cannot derive AOI from labels: vector bounds are empty or non-finite."
+            )
+
+        # Keep the derived AOI strictly rectangular: numeric bbox expansion.
+        expanded_bounds = [
+            total_bounds[0] - float(buffer_m),
+            total_bounds[1] - float(buffer_m),
+            total_bounds[2] + float(buffer_m),
+            total_bounds[3] + float(buffer_m),
+        ]
+        clamped_bounds = _clamp_bounds_to_raster(
+            raw_bounds=expanded_bounds,
+            raster_bounds=raster_bounds,
+        )
+        derived_rect = shapely_box(*clamped_bounds)
+
+        effective_extent_bounds = clamped_bounds
+        aoi_crs = raster_crs
+        aoi_source_type = "derived_from_labels"
+        aoi_derivation_method = "labels_bbox_buffered"
+
+        if output_root is not None:
+            derived_gdf = gpd.GeoDataFrame(geometry=[derived_rect], crs=raster_crs)
+            aoi_derived_out = output_root / "aoi_derived_from_labels.gpkg"
+            try:
+                derived_gdf.to_file(aoi_derived_out, driver="GPKG")
+            except Exception as exc:
+                raise ContractError(
+                    f"Failed to write derived AOI artifact: {aoi_derived_out} ({exc})"
+                ) from exc
+            aoi_reprojected_path = str(aoi_derived_out)
     else:
         effective_extent_bounds = list(raster_bounds)
 
@@ -214,6 +281,8 @@ def compute_spatial_context(
         "aoi_crs_source": aoi_crs_source,
         "aoi_reprojected": aoi_reprojected,
         "aoi_reprojected_path": aoi_reprojected_path,
+        "aoi_source_type": aoi_source_type,
+        "aoi_derivation_method": aoi_derivation_method,
         "effective_extent_bounds": effective_extent_bounds,
         "raster_bounds": raster_bounds,
         "raster_width": raster_width,
