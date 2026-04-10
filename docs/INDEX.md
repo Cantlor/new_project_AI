@@ -35,7 +35,8 @@
 
 ### `module_eval.md`
 ТЗ модуля оценки.
-Определяет группы метрик, provenance, multi-run comparison и обязательные eval artifacts.
+Определяет группы метрик, provenance, multi-run comparison и обязательные eval artifacts,
+включая baseline single-pair comparison artifacts.
 
 ---
 
@@ -58,6 +59,7 @@
 ### `MANIFEST_SCHEMAS.md`
 Схемы manifests и summaries.
 Главный документ для manifest writers, run provenance, experiment tracking и forensic-ready runs.
+Также фиксирует schema contract для comparison artifacts `module_eval`.
 
 ---
 

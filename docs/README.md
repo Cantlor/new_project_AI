@@ -82,7 +82,8 @@
 - группы метрик;
 - provenance requirements;
 - fair comparison rules;
-- eval artifacts и comparison policy.
+- eval artifacts и comparison policy, включая single-pair comparison artifacts
+  (`comparison_report.json`, `comparison_summary.json`, `comparison_delta_table.json`).
 
 ### `GLOSSARY.md`
 Единый словарь терминов проекта.
@@ -114,6 +115,7 @@
 - как фиксировать provenance;
 - как документировать runtime decisions;
 - как описывать inputs, outputs и resolved contract.
+- как формально фиксируется comparison artifact contract для `module_eval`.
 
 Это главный документ для manifest writers, run registries и comparison tooling.
 

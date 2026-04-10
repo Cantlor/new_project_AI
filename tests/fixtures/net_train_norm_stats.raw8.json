@@ -1,0 +1,15 @@
+{
+  "band_stats": [
+    {"band_idx": 0, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 1, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 2, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 3, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 4, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 5, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 6, "p_lo": 0.0, "p_hi": 2000.0},
+    {"band_idx": 7, "p_lo": 0.0, "p_hi": 2000.0}
+  ],
+  "clip_percentiles": [0.5, 99.5],
+  "n_valid_pixels": 1,
+  "computed_on": "unit_test"
+}

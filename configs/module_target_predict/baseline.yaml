@@ -1,0 +1,19 @@
+# Baseline predict config for module_target_predict v1.
+# Source of truth: module_target_predict.md §21.
+#
+# Overrides can be passed via CLI; all resolved values must be reflected in
+# predict_manifest.json (runtime section + tiling section).
+
+# Sliding window inference
+tile_size: 512
+overlap: 0.25
+blending: gaussian
+
+# Tile batch (set to 1; reduce under OOM before touching feature contract)
+tile_batch_size: 1
+
+# Device: null = hardware-adaptive (CUDA -> MPS -> CPU)
+device: null
+
+# AMP: null = auto (enabled when safe for the resolved device)
+amp: null

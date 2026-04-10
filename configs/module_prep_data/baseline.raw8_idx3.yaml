@@ -1,0 +1,48 @@
+# module_prep_data — baseline config, raw8_idx3 feature mode
+# data_contract_version: v1
+#
+# Sources:
+#   feature_mode:       DATA_CONTRACT.md §7.3 (raw8_idx3 = raw8 + NDVI + SAVI + NDWI)
+#   valid_policy:       DATA_CONTRACT.md §6.2
+#   aoi:                main_tech.md §8, DATA_CONTRACT.md §3.3
+#   patches:            main_tech.md §10
+#   boundary_encoding:  DATA_CONTRACT.md §8.3
+#   distance_target:    DATA_CONTRACT.md §8.4
+#   normalization:      DATA_CONTRACT.md §10.2, main_tech.md §7.3
+#   split:              module_prep_data.md
+#
+# Assembled model input: raw8_idx3_valid = 12 channels (8 spectral + NDVI + SAVI + NDWI + valid)
+# Dataset-side feature channels: 11 (raw8_idx3, without valid)
+# Tiled inference settings (tile_size, overlap, blending) are NOT here.
+# They belong exclusively to configs/module_target_predict/.
+
+feature_mode: raw8_idx3
+
+valid_policy:
+  nodata_source: metadata_then_config  # priority: sidecar mask > explicit nodata > config rule
+  compute_before_fill: true            # valid must be computed before any fill value is applied
+
+aoi:
+  enabled: false
+  aoi_path: null
+  buffer_m: 30                         # baseline buffer per main_tech.md §8
+
+patches:
+  patch_size: 512                      # baseline per main_tech.md §10
+  sampling_policy: strategic           # not pure random; see module_prep_data.md
+
+boundary:
+  encoding: background_skeleton_buffer # per DATA_CONTRACT.md §8.3
+
+distance:
+  target: unsigned_distance_to_boundary # per DATA_CONTRACT.md §8.4
+
+normalization:
+  name: robust_percentile
+  clip_percentiles: [0.5, 99.5]        # per main_tech.md §7.3
+  scale_range: [0.0, 1.0]
+  stats_computed_on: valid_train_pixels # per DATA_CONTRACT.md §10.2
+
+split:
+  policy: spatial_stratified
+  random_seed: 42
