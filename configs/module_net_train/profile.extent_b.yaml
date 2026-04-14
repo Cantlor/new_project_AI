@@ -1,0 +1,45 @@
+# module_net_train Run B — mild extent-heavier profile
+# Experiment: extent_weight increased to 1.5, boundary_weight reduced to 2.25
+# Purpose: investigate whether extent loss weight shift reduces "too soft" extent predictions
+# See: extent_mask_comparison_report.md
+# Baseline ref: configs/module_net_train/baseline.raw8.yaml
+
+feature_mode: raw8
+valid_as_input_channel: true  # must be True; DATA_CONTRACT.md §6.4, DEC-002
+
+model:
+  architecture: edge_aware_multitask_v1
+  encoder_depth: 4
+  base_channels: 32
+
+loss:
+  extent_weight: 1.5              # increased from 1.0 (Run A baseline)
+  boundary_weight: 2.25           # reduced from 2.5 to partially compensate
+  distance_weight: 1.0
+  aux_weight: 0.4
+  boundary_lambda_skel_dice: 0.5
+
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+
+scheduler:
+  name: cosine_with_warmup
+  warmup_epochs: 5
+  min_lr: 0.000001
+
+training:
+  batch_size: 8
+  num_epochs: 20
+  gradient_clip: 1.0
+  amp: true
+  seed: 42
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  device: null
+  augment: true
+
+monitoring:
+  monitored_metric_name: composite_boundary_extent_f1
+  monitored_metric_mode: max

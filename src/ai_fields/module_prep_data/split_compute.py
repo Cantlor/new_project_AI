@@ -125,11 +125,16 @@ def create_export_layout(
     expected_patch_size: int,
     *,
     progress_enabled: bool | None = None,
+    stats_collector: NormStatsCollector | None = None,
 ) -> dict[str, int]:
     """Create the canonical dataset directory layout and link/copy patch files.
 
     Creates dataset_dir/{train,val,test}/{img,extent,boundary,distance,valid,meta}/
     and places each patch's files in the correct split subdirectory.
+
+    If *stats_collector* is provided, train patch pixel data are read on-the-fly
+    and fed to the collector, eliminating the separate second scan that
+    ``compute_normalization_stats`` would otherwise perform.
 
     Returns dict with 'train_count', 'val_count', 'test_count'.
     """
@@ -139,10 +144,14 @@ def create_export_layout(
     total_patch_count = sum(len(ids) for ids in split_assignment.values())
     written_patch_count = 0
 
+    collect_stats = stats_collector is not None
+
     for split_name, patch_ids in split_assignment.items():
         split_dir = dataset_dir / split_name
         for layer in layer_dirs:
             (split_dir / layer).mkdir(parents=True, exist_ok=True)
+
+        is_train = split_name == "train"
 
         for pid in iter_progress(
             patch_ids,
@@ -178,6 +187,27 @@ def create_export_layout(
                 meta_dst.hardlink_to(meta_src)
             except (AttributeError, OSError):
                 shutil.copy2(meta_src, meta_dst)
+
+            # Inline norm stats collection — only for train, only when requested.
+            if collect_stats and is_train:
+                try:
+                    import numpy as np  # noqa: PLC0415
+                    import rasterio  # noqa: PLC0415
+
+                    img_src = patches_dir / f"{pid}_img.tif"
+                    valid_src = patches_dir / f"{pid}_valid.tif"
+                    with rasterio.open(img_src) as img_ds:
+                        img_data = img_ds.read().astype(np.float32)
+                    with rasterio.open(valid_src) as val_ds:
+                        valid_mask = val_ds.read(1).astype(bool)
+                    stats_collector.update(img_data, valid_mask)  # type: ignore[union-attr]
+                except ContractError:
+                    raise
+                except Exception as exc:
+                    raise ContractError(
+                        f"Inline norm stats collection failed for patch {pid}: {exc}"
+                    ) from exc
+
             written_patch_count += 1
 
         counts[f"{split_name}_count"] = len(patch_ids)
@@ -247,19 +277,208 @@ def _reservoir_update(
     values: np.ndarray,
     rng: Any,
 ) -> tuple[int, int]:
+    """Vectorized Vitter's Algorithm R batch update.
+
+    Replaces the original O(n_pixels) Python for-loop with numpy batch ops.
+    Inter-batch independence (draws don't reflect each other's mutations within
+    the same call) introduces negligible bias for large reservoirs, which is an
+    accepted approximation per architecture plan.
+    """
+    import numpy as np  # noqa: PLC0415
+
     size = int(current_size)
     seen = int(seen_count)
     cap = int(reservoir.shape[0])
-    for value in values:
-        seen += 1
-        if size < cap:
-            reservoir[size] = float(value)
-            size += 1
-            continue
-        j = int(rng.integers(0, seen))
-        if j < cap:
-            reservoir[j] = float(value)
+    values = np.asarray(values, dtype=np.float32).ravel()
+    m = len(values)
+    if m == 0:
+        return size, seen
+
+    # Phase 1: fill remaining capacity directly (no sampling needed)
+    space = min(cap - size, m)
+    if space > 0:
+        reservoir[size : size + space] = values[:space]
+        size += space
+        seen += space
+        values = values[space:]
+        m = len(values)
+    if m == 0:
+        return size, seen
+
+    # Phase 2: vectorized replacement.
+    # For position i in values, the seen counter after processing it is
+    # (seen + i + 1).  Draw j ~ Uniform[0, seen + i + 1).  Accept if j < cap.
+    seen_offsets = np.arange(1, m + 1, dtype=np.int64) + np.int64(seen)
+    j_vals = rng.integers(np.int64(0), seen_offsets, dtype=np.int64)
+    accept = j_vals < cap
+    # Fancy indexing: last-write semantics for rare duplicate j_vals.
+    reservoir[j_vals[accept]] = values[accept]
+    seen += m
     return size, seen
+
+
+class NormStatsCollector:
+    """Collect per-band normalization stats incrementally during patch export.
+
+    Eliminates the separate second scan of train patches that
+    ``compute_normalization_stats`` performs after ``create_export_layout``.
+    Call ``update(img_data, valid_mask)`` for each train patch as it is
+    exported, then ``finalize()`` to get the norm_stats dict.
+    """
+
+    def __init__(
+        self,
+        *,
+        clip_percentiles: tuple[float, float] = (0.5, 99.5),
+        random_seed: int = 42,
+        exact_threshold_pixels: int = _DEFAULT_NORM_EXACT_THRESHOLD_PIXELS,
+        reservoir_capacity_per_band: int = _DEFAULT_RESERVOIR_CAPACITY_PER_BAND,
+    ) -> None:
+        import numpy as np  # noqa: PLC0415
+
+        if exact_threshold_pixels <= 0:
+            raise ContractError(
+                f"exact_threshold_pixels must be > 0, got {exact_threshold_pixels}."
+            )
+        if reservoir_capacity_per_band <= 0:
+            raise ContractError(
+                "reservoir_capacity_per_band must be > 0, "
+                f"got {reservoir_capacity_per_band}."
+            )
+
+        self._np = np
+        self._clip_percentiles = clip_percentiles
+        self._rng = np.random.default_rng(seed=random_seed)
+        self._random_seed = random_seed
+        self._exact_threshold_pixels = exact_threshold_pixels
+        self._reservoir_capacity_per_band = reservoir_capacity_per_band
+
+        self._exact_mode: bool = True
+        self._total_valid_pixels: int = 0
+        self._band_count: int | None = None
+        self._exact_values: dict[int, list] = {}
+        self._reservoir: dict[int, Any] = {}
+        self._reservoir_sizes: dict[int, int] = {}
+        self._reservoir_seen: dict[int, int] = {}
+
+    def update(self, img_data: np.ndarray, valid_mask: np.ndarray) -> None:
+        """Ingest one patch.  img_data: (C, H, W) float32; valid_mask: (H, W) bool."""
+        np = self._np
+        n_bands = int(img_data.shape[0])
+
+        if self._band_count is None:
+            self._band_count = n_bands
+        elif self._band_count != n_bands:
+            raise ContractError(
+                f"Inconsistent band count in NormStatsCollector: "
+                f"expected {self._band_count}, got {n_bands}."
+            )
+
+        n_patch_valid = int(valid_mask.sum())
+        if n_patch_valid <= 0:
+            return
+        self._total_valid_pixels += n_patch_valid
+
+        if self._exact_mode and self._total_valid_pixels <= self._exact_threshold_pixels:
+            for band_idx in range(n_bands):
+                vals = img_data[band_idx][valid_mask]
+                if vals.size == 0:
+                    continue
+                self._exact_values.setdefault(band_idx, []).append(
+                    vals.astype(np.float32, copy=False)
+                )
+            return
+
+        # Threshold exceeded — switch to reservoir mode and migrate exact data.
+        if self._exact_mode:
+            self._exact_mode = False
+            for band_idx in range(n_bands):
+                self._reservoir[band_idx] = np.empty(
+                    self._reservoir_capacity_per_band, dtype=np.float32
+                )
+                self._reservoir_sizes[band_idx] = 0
+                self._reservoir_seen[band_idx] = 0
+                for chunk in self._exact_values.get(band_idx, []):
+                    size, seen = _reservoir_update(
+                        reservoir=self._reservoir[band_idx],
+                        current_size=self._reservoir_sizes[band_idx],
+                        seen_count=self._reservoir_seen[band_idx],
+                        values=chunk,
+                        rng=self._rng,
+                    )
+                    self._reservoir_sizes[band_idx] = size
+                    self._reservoir_seen[band_idx] = seen
+            self._exact_values = {}
+
+        for band_idx in range(n_bands):
+            vals = img_data[band_idx][valid_mask]
+            if vals.size == 0:
+                continue
+            size, seen = _reservoir_update(
+                reservoir=self._reservoir[band_idx],
+                current_size=self._reservoir_sizes[band_idx],
+                seen_count=self._reservoir_seen[band_idx],
+                values=vals.astype(np.float32, copy=False),
+                rng=self._rng,
+            )
+            self._reservoir_sizes[band_idx] = size
+            self._reservoir_seen[band_idx] = seen
+
+    def finalize(self) -> dict:
+        """Return the norm_stats dict.  Caller writes norm_stats.json."""
+        np = self._np
+        if self._band_count is None:
+            raise ContractError("NormStatsCollector.finalize() called with no data.")
+
+        p_lo, p_hi = self._clip_percentiles
+        band_stats: list[dict] = []
+
+        if self._exact_mode:
+            method = _NORM_METHOD_EXACT
+            approximation = False
+            for band_idx in range(self._band_count):
+                chunks = self._exact_values.get(band_idx, [])
+                if not chunks:
+                    raise ContractError(
+                        f"No valid train pixels for band_idx={band_idx} in exact mode."
+                    )
+                all_vals = np.concatenate(chunks)
+                band_stats.append(
+                    {
+                        "band_idx": int(band_idx),
+                        "p_lo": float(np.percentile(all_vals, p_lo)),
+                        "p_hi": float(np.percentile(all_vals, p_hi)),
+                    }
+                )
+        else:
+            method = _NORM_METHOD_RESERVOIR
+            approximation = True
+            for band_idx in range(self._band_count):
+                if self._reservoir_sizes.get(band_idx, 0) <= 0:
+                    raise ContractError(
+                        f"Reservoir produced no samples for band_idx={band_idx}."
+                    )
+                sample = self._reservoir[band_idx][: self._reservoir_sizes[band_idx]]
+                band_stats.append(
+                    {
+                        "band_idx": int(band_idx),
+                        "p_lo": float(np.percentile(sample, p_lo)),
+                        "p_hi": float(np.percentile(sample, p_hi)),
+                    }
+                )
+
+        return {
+            "band_stats": band_stats,
+            "n_valid_pixels": int(self._total_valid_pixels),
+            "computed_on": "valid_train_pixels",
+            "clip_percentiles": [float(p_lo), float(p_hi)],
+            "method": method,
+            "approximation": approximation,
+            "rng_seed": int(self._random_seed),
+            "exact_threshold_pixels": int(self._exact_threshold_pixels),
+            "reservoir_capacity_per_band": int(self._reservoir_capacity_per_band),
+            "stats_collected_during_export": True,
+        }
 
 
 def compute_normalization_stats(
@@ -487,34 +706,47 @@ def compute_and_save_split(
         random_seed=random_seed_val,
     )
 
+    clip_percentiles_cfg = getattr(
+        getattr(config, "normalization", None), "clip_percentiles", (0.5, 99.5)
+    )
+    random_seed_resolved = int(random_seed_val) if random_seed_val is not None else 42
+    clip_pcts = tuple(float(v) for v in clip_percentiles_cfg)
+
+    # Inline collector: feed stats during the export loop, no second scan.
+    stats_collector = NormStatsCollector(
+        clip_percentiles=clip_pcts,
+        random_seed=random_seed_resolved,
+    )
+
     counts = create_export_layout(
         patches_dir,
         dataset_dir,
         split_assignment,
         expected_patch_size=int(config.patches.patch_size),
         progress_enabled=progress_enabled,
+        stats_collector=stats_collector,
     )
 
-    clip_percentiles_cfg = getattr(
-        getattr(config, "normalization", None), "clip_percentiles", (0.5, 99.5)
-    )
-    norm_stats = compute_normalization_stats(
-        dataset_dir,
-        clip_percentiles=tuple(float(v) for v in clip_percentiles_cfg),
-        progress_enabled=progress_enabled,
-        random_seed=int(random_seed_val) if random_seed_val is not None else 42,
-    )
+    norm_stats_dict = stats_collector.finalize()
+    norm_stats_path = dataset_dir / _NORM_STATS_FILENAME
+    try:
+        norm_stats_path.write_text(
+            json.dumps(norm_stats_dict, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        raise ContractError(f"Failed to write norm_stats.json: {exc}") from exc
+    norm_stats_dict["norm_stats_path"] = str(norm_stats_path)
 
     return {
         "train_count": counts.get("train_count", 0),
         "val_count": counts.get("val_count", 0),
         "test_count": counts.get("test_count", 0),
-        "norm_stats_path": norm_stats.get("norm_stats_path"),
-        "normalization_method": norm_stats.get("method"),
-        "normalization_approximation": norm_stats.get("approximation"),
-        "normalization_rng_seed": norm_stats.get("rng_seed"),
-        "normalization_exact_threshold_pixels": norm_stats.get("exact_threshold_pixels"),
-        "normalization_reservoir_capacity_per_band": norm_stats.get(
+        "norm_stats_path": norm_stats_dict.get("norm_stats_path"),
+        "normalization_method": norm_stats_dict.get("method"),
+        "normalization_approximation": norm_stats_dict.get("approximation"),
+        "normalization_rng_seed": norm_stats_dict.get("rng_seed"),
+        "normalization_exact_threshold_pixels": norm_stats_dict.get("exact_threshold_pixels"),
+        "normalization_reservoir_capacity_per_band": norm_stats_dict.get(
             "reservoir_capacity_per_band"
         ),
         "split_assignment_executed": True,
