@@ -28,12 +28,14 @@ aoi:
 patches:
   patch_size: 512                      # baseline per main_tech.md §10
   sampling_policy: strategic           # not pure random; see module_prep_data.md
+  halo_px: 64                          # patch-local halo for memory-safe target materialization
 
 boundary:
   encoding: background_skeleton_buffer # per DATA_CONTRACT.md §8.3
 
 distance:
   target: unsigned_distance_to_boundary # per DATA_CONTRACT.md §8.4
+  distance_clip_px: 64                  # must satisfy distance_clip_px <= halo_px
 
 normalization:
   name: robust_percentile

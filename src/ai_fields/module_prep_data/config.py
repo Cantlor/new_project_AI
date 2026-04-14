@@ -251,7 +251,7 @@ def _build_patches(d: Optional[Dict[str, Any]]) -> PatchesConfig:
     if d is None:
         return PatchesConfig()
     d = _ensure_section_mapping("patches", d)
-    unknown = set(d) - {"patch_size", "sampling_policy"}
+    unknown = set(d) - {"patch_size", "sampling_policy", "halo_px"}
     if unknown:
         warnings.warn(
             f"Unknown keys in patches section: {_sorted_unknown_keys(unknown)}.  "
@@ -261,6 +261,7 @@ def _build_patches(d: Optional[Dict[str, Any]]) -> PatchesConfig:
     return PatchesConfig(
         patch_size=_get_int("patches", d, "patch_size", 512),
         sampling_policy=_get_str("patches", d, "sampling_policy", "strategic"),
+        halo_px=_get_int("patches", d, "halo_px", 64),
     )
 
 
@@ -286,7 +287,7 @@ def _build_distance(d: Optional[Dict[str, Any]]) -> DistanceConfig:
     if d is None:
         return DistanceConfig()
     d = _ensure_section_mapping("distance", d)
-    unknown = set(d) - {"target"}
+    unknown = set(d) - {"target", "distance_clip_px"}
     if unknown:
         warnings.warn(
             f"Unknown keys in distance section: {_sorted_unknown_keys(unknown)}.  "
@@ -296,7 +297,8 @@ def _build_distance(d: Optional[Dict[str, Any]]) -> DistanceConfig:
     return DistanceConfig(
         target=_get_str(
             "distance", d, "target", "unsigned_distance_to_boundary"
-        )
+        ),
+        distance_clip_px=_get_int("distance", d, "distance_clip_px", 64),
     )
 
 

@@ -40,6 +40,12 @@ _MANIFEST_FILENAME = "targets_manifest.json"
 _SUMMARY_FILENAME = "summary.json"
 _INPUT_REFS_SOURCE = "stage_args_transitional"
 _TARGET_CONTRACT_MODE = "metadata_snapshot_only"
+_MATERIALIZATION_COMPUTE_SPEC_ONLY = "compute_spec_only"
+_MATERIALIZATION_FULL_SCENE = "full_scene"
+_ALLOWED_MATERIALIZATION_MODES = {
+    _MATERIALIZATION_COMPUTE_SPEC_ONLY,
+    _MATERIALIZATION_FULL_SCENE,
+}
 
 _TARGET_LAYERS = ("extent", "boundary", "distance", "valid")
 _ERROR_CODE_ATTR = "stage_error_code"
@@ -245,6 +251,24 @@ def _resolve_target_contract(
         "policy_source": "baseline_v1_default",
         "notes": "boundary_raw is treated as required diagnostic artifact in baseline v1.",
     }
+    extent_policy = {
+        "encoding": {"background": 0, "foreground": 1, "ignore": 255},
+        "invalid_to_ignore": True,
+        "invalid_defined_by_valid_mask": True,
+    }
+    halo_px = int(resolved_config.patches.halo_px)
+    distance_clip_px = int(resolved_config.distance.distance_clip_px)
+    distance_policy = {
+        "target": distance_target,
+        "mode": "patch_local_clipped",
+        "distance_clip_px": distance_clip_px,
+        "requires_distance_clip_lte_halo": True,
+    }
+    halo_policy = {
+        "halo_px": halo_px,
+        "distance_clip_px": distance_clip_px,
+        "distance_clip_within_halo": distance_clip_px <= halo_px,
+    }
     valid_semantics = {
         "valid_target_layer_required": True,
         "valid_ignore_semantics": "valid=0 is ignore/invalid; valid=1 is usable.",
@@ -370,6 +394,9 @@ def _resolve_target_contract(
         "distance_target": distance_target,
         "valid_saved_separately": valid_saved_separately,
         "boundary_raw_policy": boundary_raw_policy,
+        "extent_policy": extent_policy,
+        "distance_policy": distance_policy,
+        "halo_policy": halo_policy,
         "valid_semantics": valid_semantics,
         "target_metadata_checked": target_metadata_checked,
     }
@@ -434,6 +461,7 @@ def run_prepare_targets_stage(
     source_manifest_path: str | Path | None = None,
     module_version: str | None = None,
     runtime_compute_enabled: bool = True,
+    materialization_mode: str = _MATERIALIZATION_COMPUTE_SPEC_ONLY,
 ) -> PrepareTargetsStageResult:
     """Run lightweight `04_prepare_targets` stage and write manifest/summary.
 
@@ -468,11 +496,15 @@ def run_prepare_targets_stage(
     input_valid_path: str | None = None
     normalized_source_manifest_path: str | None = None
     target_contract_mode = _TARGET_CONTRACT_MODE
+    resolved_materialization_mode = _MATERIALIZATION_COMPUTE_SPEC_ONLY
     extent_output_path: str | None = None
     boundary_output_path: str | None = None
     boundary_raw_output_path: str | None = None
     distance_output_path: str | None = None
     valid_output_path: str | None = None
+    extent_policy: dict[str, Any] | None = None
+    distance_policy: dict[str, Any] | None = None
+    halo_policy: dict[str, Any] | None = None
 
     try:
         input_paths = prep_data_validators.validate_input_paths_contract(
@@ -483,6 +515,16 @@ def run_prepare_targets_stage(
         input_raster_path = str(input_paths["raster_path"])
         input_vector_path = str(input_paths["vector_path"])
         input_valid_path = _normalize_optional_path("valid_path", valid_path)
+        if materialization_mode not in _ALLOWED_MATERIALIZATION_MODES:
+            raise ContractError(
+                "materialization_mode for stage 04 must be one of "
+                f"{sorted(_ALLOWED_MATERIALIZATION_MODES)}, got {materialization_mode!r}."
+            )
+        if materialization_mode == _MATERIALIZATION_FULL_SCENE and not runtime_compute_enabled:
+            raise ContractError(
+                "materialization_mode='full_scene' requires runtime_compute_enabled=True."
+            )
+        resolved_materialization_mode = materialization_mode
         if source_manifest_path is not None:
             normalized_source_manifest_path = str(
                 _normalize_path("source_manifest_path", source_manifest_path)
@@ -499,10 +541,13 @@ def run_prepare_targets_stage(
         distance_target = resolved["distance_target"]
         valid_saved_separately = resolved["valid_saved_separately"]
         boundary_raw_policy = resolved["boundary_raw_policy"]
+        extent_policy = resolved["extent_policy"]
+        distance_policy = resolved["distance_policy"]
+        halo_policy = resolved["halo_policy"]
         valid_semantics = resolved["valid_semantics"]
         target_metadata_checked = resolved["target_metadata_checked"]
 
-        if runtime_compute_enabled:
+        if runtime_compute_enabled and resolved_materialization_mode == _MATERIALIZATION_FULL_SCENE:
             if targets_compute is None:
                 raise ContractError(
                     "runtime_compute_enabled=True but targets_compute module "
@@ -513,13 +558,14 @@ def run_prepare_targets_stage(
                 vector_path=vector_path,
                 output_dir=output_root,
                 valid_path=valid_path,
+                distance_clip_px=int(resolved_config.distance.distance_clip_px),
             )
             extent_output_path = str(compute_result["extent_path"])
             boundary_output_path = str(compute_result["boundary_path"])
             boundary_raw_output_path = str(compute_result["boundary_raw_path"])
             distance_output_path = str(compute_result["distance_path"])
             valid_output_path = str(compute_result["valid_path"])
-            target_contract_mode = "runtime_compute"
+            target_contract_mode = "runtime_compute_full_scene"
 
         status = "success"
         checks = _build_success_checks(target_metadata_checked=resolved["target_metadata_checked"])
@@ -554,6 +600,7 @@ def run_prepare_targets_stage(
             "distance_target": distance_target,
             "runtime_compute_enabled": runtime_compute_enabled,
             "target_contract_mode": target_contract_mode,
+            "materialization_mode": resolved_materialization_mode,
         },
         "provenance": {
             "source_run_ids": [],
@@ -583,6 +630,27 @@ def run_prepare_targets_stage(
                     None if valid_semantics is None else valid_semantics["valid_ignore_semantics"]
                 ),
             },
+            "targets": {
+                "target_layers": target_layers if target_layers is not None else [],
+                "boundary_encoding": boundary_encoding,
+                "distance_target": distance_target,
+                "extent_policy": extent_policy,
+                "boundary_policy": boundary_raw_policy,
+                "distance_policy": distance_policy,
+                "valid_ignore_policy": valid_semantics,
+                "halo_policy": halo_policy,
+                "target_compute_spec": {
+                    "target_layers": target_layers if target_layers is not None else [],
+                    "boundary_encoding": boundary_encoding,
+                    "distance_target": distance_target,
+                    "distance_clip_px": (
+                        None if distance_policy is None else distance_policy.get("distance_clip_px")
+                    ),
+                    "halo_px": None if halo_policy is None else halo_policy.get("halo_px"),
+                },
+                "window_processing_enabled": True,
+                "materialization_mode": resolved_materialization_mode,
+            },
             "normalization": None,
             "aoi_policy": (
                 None
@@ -610,11 +678,26 @@ def run_prepare_targets_stage(
         "distance_output_path": distance_output_path,
         "valid_output_path": valid_output_path,
         "target_contract_mode": target_contract_mode,
+        "materialization_mode": resolved_materialization_mode,
         "target_layers": target_layers if target_layers is not None else [],
         "boundary_encoding": boundary_encoding,
         "distance_target": distance_target,
         "valid_saved_separately": valid_saved_separately,
         "valid_semantics": valid_semantics,
+        "extent_policy": extent_policy,
+        "distance_policy": distance_policy,
+        "halo_policy": halo_policy,
+        "valid_ignore_policy": valid_semantics,
+        "target_compute_spec": {
+            "target_layers": target_layers if target_layers is not None else [],
+            "boundary_encoding": boundary_encoding,
+            "distance_target": distance_target,
+            "distance_clip_px": (
+                None if distance_policy is None else distance_policy.get("distance_clip_px")
+            ),
+            "halo_px": None if halo_policy is None else halo_policy.get("halo_px"),
+        },
+        "window_processing_enabled": True,
         "boundary_raw_policy": boundary_raw_policy,
         "checks": checks,
         "diagnostics": {
@@ -632,6 +715,7 @@ def run_prepare_targets_stage(
         "input_refs_source": _INPUT_REFS_SOURCE,
         "contract_checks_passed": status == "success",
         "target_contract_mode": target_contract_mode,
+        "materialization_mode": resolved_materialization_mode,
         "target_layers": target_layers,
         "boundary_encoding": boundary_encoding,
         "distance_target": distance_target,

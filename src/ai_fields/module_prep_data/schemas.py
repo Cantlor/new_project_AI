@@ -151,6 +151,13 @@ class PatchesConfig:
     sampling_policy: str = "strategic"
     """Sampling strategy.  Accepted values: "strategic", "random"."""
 
+    halo_px: int = 64
+    """Halo size (in pixels) used for patch-local context and distance target clipping.
+
+    Contract:
+      - must satisfy 0 < halo_px <= patch_size.
+    """
+
     SUPPORTED_PATCH_SIZES: Tuple[int, ...] = field(
         default=(256, 384, 512), init=False, repr=False, compare=False
     )
@@ -166,10 +173,23 @@ class PatchesConfig:
                 "patches.sampling_policy must be a string, "
                 f"got {type(self.sampling_policy).__name__}."
             )
+        if isinstance(self.halo_px, bool) or not isinstance(self.halo_px, int):
+            raise ContractError(
+                f"patches.halo_px must be an integer, got {type(self.halo_px).__name__}."
+            )
         if self.patch_size not in (256, 384, 512):
             raise ContractError(
                 f"patches.patch_size must be 256, 384, or 512, got {self.patch_size}.  "
                 "(module_prep_data.md §12.1)"
+            )
+        if self.halo_px <= 0:
+            raise ContractError(
+                f"patches.halo_px must be > 0, got {self.halo_px}."
+            )
+        if self.halo_px > self.patch_size:
+            raise ContractError(
+                f"patches.halo_px must be <= patches.patch_size, got halo_px={self.halo_px}, "
+                f"patch_size={self.patch_size}."
             )
         accepted_policies = {"strategic", "random"}
         if self.sampling_policy not in accepted_policies:
@@ -217,6 +237,14 @@ class DistanceConfig:
     supported in v1 (DATA_CONTRACT.md §8.4).
     """
 
+    distance_clip_px: int = 64
+    """Maximum distance value preserved in patch-local distance targets.
+
+    Contract:
+      - must satisfy 0 < distance_clip_px
+      - and in the full PrepDataConfig contract distance_clip_px <= patches.halo_px
+    """
+
     def validate(self) -> None:
         if not isinstance(self.target, str):
             raise ContractError(
@@ -227,6 +255,15 @@ class DistanceConfig:
                 f"distance.target '{self.target}' is not supported.  "
                 "Only 'unsigned_distance_to_boundary' is accepted in v1 "
                 "(DATA_CONTRACT.md §8.4)."
+            )
+        if isinstance(self.distance_clip_px, bool) or not isinstance(self.distance_clip_px, int):
+            raise ContractError(
+                "distance.distance_clip_px must be an integer, "
+                f"got {type(self.distance_clip_px).__name__}."
+            )
+        if self.distance_clip_px <= 0:
+            raise ContractError(
+                f"distance.distance_clip_px must be > 0, got {self.distance_clip_px}."
             )
 
 
@@ -416,5 +453,10 @@ class PrepDataConfig:
         self.patches.validate()
         self.boundary.validate()
         self.distance.validate()
+        if self.distance.distance_clip_px > self.patches.halo_px:
+            raise ContractError(
+                "distance.distance_clip_px must be <= patches.halo_px, got "
+                f"distance_clip_px={self.distance.distance_clip_px}, halo_px={self.patches.halo_px}."
+            )
         self.normalization.validate()
         self.split.validate()

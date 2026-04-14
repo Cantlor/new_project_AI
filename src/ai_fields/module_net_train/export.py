@@ -12,6 +12,7 @@ It intentionally avoids building a full experiment manager framework.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
@@ -130,6 +131,90 @@ def _normalize_normalization_contract(normalization: Any) -> dict[str, Any]:
         "stats_source": stats_source,
         "clip_percentiles": clip_percentiles,
         "scaling_range": scaling_range,
+    }
+
+
+def _read_json_object_or_none(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    return dict(payload)
+
+
+def _optional_numeric(value: Any) -> float | None:
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _resolve_spatial_contract(
+    *,
+    source_manifest_path: Path,
+    dataset_patch_size: int | None,
+) -> dict[str, Any]:
+    """Resolve non-empty spatial contract without fabricating unavailable detail.
+
+    Baseline rule:
+      - if prep_data split manifest has spatial fields, reuse them;
+      - otherwise keep contract explicit with conservative defaults and
+        patch-grid information validated by net_train dataset contract.
+    """
+    reference_grid_source = "prep_data_split_manifest_patch_grid"
+    reference_crs = "unknown"
+    reference_resolution: float | None = None
+    alignment_policy = "fixed_square_patch_grid_from_prep_data"
+    aoi_used = False
+    aoi_buffer_m: float | None = None
+
+    source_manifest = _read_json_object_or_none(source_manifest_path)
+    if source_manifest is not None:
+        resolved_contract = source_manifest.get("resolved_contract")
+        if isinstance(resolved_contract, Mapping):
+            spatial = resolved_contract.get("spatial")
+            if isinstance(spatial, Mapping):
+                ref_src = spatial.get("reference_grid_source")
+                if isinstance(ref_src, str) and ref_src.strip():
+                    reference_grid_source = ref_src
+                ref_crs = spatial.get("reference_crs")
+                if isinstance(ref_crs, str) and ref_crs.strip():
+                    reference_crs = ref_crs
+                ref_res = _optional_numeric(spatial.get("reference_resolution"))
+                if ref_res is not None:
+                    reference_resolution = ref_res
+                align = spatial.get("alignment_policy")
+                if isinstance(align, str) and align.strip():
+                    alignment_policy = align
+                if isinstance(spatial.get("aoi_used"), bool):
+                    aoi_used = bool(spatial.get("aoi_used"))
+                aoi_buf = _optional_numeric(spatial.get("aoi_buffer_m"))
+                if aoi_buf is not None:
+                    aoi_buffer_m = aoi_buf
+
+            aoi_policy = resolved_contract.get("aoi_policy")
+            if isinstance(aoi_policy, Mapping):
+                # Upstream prep_data manifests store AOI usage in aoi_policy.enabled.
+                if isinstance(aoi_policy.get("enabled"), bool):
+                    aoi_used = bool(aoi_policy.get("enabled"))
+                aoi_buf = _optional_numeric(aoi_policy.get("buffer_m"))
+                if aoi_buf is not None:
+                    aoi_buffer_m = aoi_buf
+
+    return {
+        "reference_grid_source": reference_grid_source,
+        "reference_crs": reference_crs,
+        "reference_resolution": reference_resolution,
+        "alignment_policy": alignment_policy,
+        "aoi_used": aoi_used,
+        "aoi_buffer_m": aoi_buffer_m,
+        "patch_size_px": dataset_patch_size,
+        "patch_shape": "square",
     }
 
 
@@ -371,9 +456,18 @@ def export_training_artifacts(
     history_path: str | Path | None = None,
     train_summary: Mapping[str, Any] | None = None,
     val_summary: Mapping[str, Any] | None = None,
+    eval_val_summary: Mapping[str, Any] | None = None,
+    eval_val_path: str | Path | None = None,
+    eval_test_summary: Mapping[str, Any] | None = None,
+    eval_test_path: str | Path | None = None,
     monitored_metric_policy_note: str | None = None,
     scheduler_step_policy: str | None = None,
     scheduler_last_lr: float | None = None,
+    device_requested: str | None = None,
+    device_resolved: str | None = None,
+    amp_requested: bool | None = None,
+    amp_used: bool | None = None,
+    oom_fallbacks_applied: Sequence[str] | None = None,
 ) -> NetTrainExportArtifacts:
     """Export minimal Stage E artifacts for module_net_train.
 
@@ -458,6 +552,125 @@ def export_training_artifacts(
         if history_path is not None
         else None
     )
+    resolved_eval_val_path = (
+        _normalize_path(eval_val_path, name="eval_val_path")
+        if eval_val_path is not None
+        else None
+    )
+    resolved_eval_test_path = (
+        _normalize_path(eval_test_path, name="eval_test_path")
+        if eval_test_path is not None
+        else None
+    )
+    if eval_val_summary is not None and not isinstance(eval_val_summary, Mapping):
+        raise ContractError(
+            f"eval_val_summary must be a mapping/object, got {type(eval_val_summary).__name__}."
+        )
+    if eval_test_summary is not None and not isinstance(eval_test_summary, Mapping):
+        raise ContractError(
+            f"eval_test_summary must be a mapping/object, got {type(eval_test_summary).__name__}."
+        )
+
+    runtime_device_requested = (
+        getattr(getattr(config, "training", None), "device", None)
+        if device_requested is None
+        else device_requested
+    )
+    if runtime_device_requested is not None and not isinstance(runtime_device_requested, str):
+        raise ContractError(
+            "device_requested must be a string or null, "
+            f"got {type(runtime_device_requested).__name__}."
+        )
+    if device_resolved is not None and not isinstance(device_resolved, str):
+        raise ContractError(
+            "device_resolved must be a string or null, "
+            f"got {type(device_resolved).__name__}."
+        )
+    runtime_device_resolved = device_resolved
+
+    runtime_amp_requested = (
+        bool(getattr(getattr(config, "training", None), "amp", False))
+        if amp_requested is None
+        else amp_requested
+    )
+    if not isinstance(runtime_amp_requested, bool):
+        raise ContractError(
+            f"amp_requested must be a boolean, got {type(runtime_amp_requested).__name__}."
+        )
+    runtime_amp_used = runtime_amp_requested if amp_used is None else amp_used
+    if not isinstance(runtime_amp_used, bool):
+        raise ContractError(
+            f"amp_used must be a boolean, got {type(runtime_amp_used).__name__}."
+        )
+
+    runtime_oom_fallbacks: list[str] = []
+    if oom_fallbacks_applied is not None:
+        if isinstance(oom_fallbacks_applied, (str, bytes)):
+            raise ContractError("oom_fallbacks_applied must be a sequence of strings.")
+        for idx, item in enumerate(oom_fallbacks_applied):
+            if not isinstance(item, str) or item.strip() == "":
+                raise ContractError(
+                    f"oom_fallbacks_applied[{idx}] must be a non-empty string."
+                )
+            runtime_oom_fallbacks.append(item)
+
+    training_cfg = getattr(config, "training", None)
+    training_batch_size_raw = getattr(training_cfg, "batch_size", None)
+    training_seed_raw = getattr(training_cfg, "seed", None)
+    training_grad_accum_raw = getattr(training_cfg, "gradient_accumulation_steps", None)
+
+    training_batch_size: int | None
+    if training_batch_size_raw is None:
+        training_batch_size = None
+    elif isinstance(training_batch_size_raw, bool) or not isinstance(training_batch_size_raw, int):
+        raise ContractError(
+            "config.training.batch_size must be an integer or null for train manifest export."
+        )
+    elif training_batch_size_raw < 1:
+        raise ContractError("config.training.batch_size must be >= 1 when provided.")
+    else:
+        training_batch_size = training_batch_size_raw
+
+    training_seed: int | None
+    if training_seed_raw is None:
+        training_seed = None
+    elif isinstance(training_seed_raw, bool) or not isinstance(training_seed_raw, int):
+        raise ContractError(
+            "config.training.seed must be an integer or null for train manifest export."
+        )
+    elif training_seed_raw < 1:
+        raise ContractError("config.training.seed must be >= 1 when provided.")
+    else:
+        training_seed = training_seed_raw
+
+    training_grad_accum_steps: int | None
+    if training_grad_accum_raw is None:
+        training_grad_accum_steps = None
+    elif (
+        isinstance(training_grad_accum_raw, bool)
+        or not isinstance(training_grad_accum_raw, int)
+    ):
+        raise ContractError(
+            "config.training.gradient_accumulation_steps must be an integer or null "
+            "for train manifest export."
+        )
+    elif training_grad_accum_raw < 1:
+        raise ContractError("config.training.gradient_accumulation_steps must be >= 1 when provided.")
+    else:
+        training_grad_accum_steps = training_grad_accum_raw
+
+    # Conservative effective-batch rule for current single-process baseline:
+    # effective_batch_size = batch_size * gradient_accumulation_steps.
+    # If either value is unavailable, effective_batch_size remains null.
+    effective_batch_size = (
+        training_batch_size * training_grad_accum_steps
+        if training_batch_size is not None and training_grad_accum_steps is not None
+        else None
+    )
+    spatial_contract = _resolve_spatial_contract(
+        source_manifest_path=source_manifest_path,
+        dataset_patch_size=dataset_patch_size,
+    )
 
     checkpoint_path = resolved_run_dir / checkpoint_filename
     checkpoint_metadata_path = resolved_run_dir / "checkpoint_metadata.json"
@@ -529,6 +742,54 @@ def export_training_artifacts(
     )
     write_manifest(checkpoint_metadata_path, checkpoint_metadata)
 
+    outputs_artifacts: list[dict[str, Any]] = [
+        {
+            "path": str(checkpoint_path),
+            "role": "checkpoint",
+            "format": "pytorch",
+            "is_required": True,
+            "exists": checkpoint_path.exists(),
+        },
+        {
+            "path": str(resolved_last_checkpoint_path)
+            if resolved_last_checkpoint_path is not None
+            else None,
+            "role": "last_checkpoint",
+            "format": "pytorch",
+            "is_required": False,
+            "exists": bool(
+                resolved_last_checkpoint_path is not None and resolved_last_checkpoint_path.exists()
+            ),
+        },
+        {
+            "path": str(checkpoint_metadata_path),
+            "role": "checkpoint_metadata",
+            "format": "json",
+            "is_required": True,
+            "exists": True,
+        },
+    ]
+    if resolved_eval_val_path is not None:
+        outputs_artifacts.append(
+            {
+                "path": str(resolved_eval_val_path),
+                "role": "eval_val",
+                "format": "json",
+                "is_required": True,
+                "exists": resolved_eval_val_path.exists(),
+            }
+        )
+    if resolved_eval_test_path is not None:
+        outputs_artifacts.append(
+            {
+                "path": str(resolved_eval_test_path),
+                "role": "eval_test",
+                "format": "json",
+                "is_required": False,
+                "exists": resolved_eval_test_path.exists(),
+            }
+        )
+
     train_manifest = _manifest_base(
         schema_name="net_train.train_manifest",
         run_id=run_id,
@@ -575,9 +836,12 @@ def export_training_artifacts(
                 "last_lr": scheduler_last_lr,
             },
             "training": {
-                "batch_size": getattr(getattr(config, "training", None), "batch_size", None),
+                "batch_size": training_batch_size,
+                "seed": training_seed,
+                "gradient_accumulation_steps": training_grad_accum_steps,
+                "effective_batch_size": effective_batch_size,
                 "epochs_completed": epochs_completed,
-                "amp_used": bool(getattr(getattr(config, "training", None), "amp", False)),
+                "amp_used": runtime_amp_used,
                 "augment": bool(getattr(getattr(config, "training", None), "augment", True)),
                 "best_checkpoint_metric": best_metric_name,
                 "best_metric_value": best_metric_value,
@@ -607,36 +871,7 @@ def export_training_artifacts(
                     }
                 ]
             },
-            "outputs": {
-                "artifacts": [
-                    {
-                        "path": str(checkpoint_path),
-                        "role": "checkpoint",
-                        "format": "pytorch",
-                        "is_required": True,
-                        "exists": checkpoint_path.exists(),
-                    },
-                    {
-                        "path": str(resolved_last_checkpoint_path)
-                        if resolved_last_checkpoint_path is not None
-                        else None,
-                        "role": "last_checkpoint",
-                        "format": "pytorch",
-                        "is_required": False,
-                        "exists": bool(
-                            resolved_last_checkpoint_path is not None
-                            and resolved_last_checkpoint_path.exists()
-                        ),
-                    },
-                    {
-                        "path": str(checkpoint_metadata_path),
-                        "role": "checkpoint_metadata",
-                        "format": "json",
-                        "is_required": True,
-                        "exists": True,
-                    },
-                ]
-            },
+            "outputs": {"artifacts": outputs_artifacts},
             "resolved_contract": {
                 "features": {
                     "dataset_feature_mode": feature_mode,
@@ -653,7 +888,7 @@ def export_training_artifacts(
                     "invalid_handling": "exclude_from_loss_metrics_and_runtime_checks",
                     "nodata_policy": "no_silent_fallback",
                 },
-                "spatial": {},
+                "spatial": spatial_contract,
                 "dataset": {
                     "dataset_root": str(resolved_dataset_root)
                     if resolved_dataset_root is not None
@@ -664,15 +899,17 @@ def export_training_artifacts(
                 "aoi_policy": None,
             },
             "runtime": {
-                "device_requested": getattr(getattr(config, "training", None), "device", None),
-                "device_resolved": None,
-                "amp_requested": bool(getattr(getattr(config, "training", None), "amp", False)),
-                "amp_used": bool(getattr(getattr(config, "training", None), "amp", False)),
-                "oom_fallbacks_applied": [],
+                "device_requested": runtime_device_requested,
+                "device_resolved": runtime_device_resolved,
+                "amp_requested": runtime_amp_requested,
+                "amp_used": runtime_amp_used,
+                "oom_fallbacks_applied": runtime_oom_fallbacks,
                 "notes": [],
             },
             "diagnostics": {"warnings": [], "errors": []},
             "history_path": str(resolved_history_path) if resolved_history_path is not None else None,
+            "eval_val_path": str(resolved_eval_val_path) if resolved_eval_val_path is not None else None,
+            "eval_test_path": str(resolved_eval_test_path) if resolved_eval_test_path is not None else None,
             "last_checkpoint_path": str(resolved_last_checkpoint_path)
             if resolved_last_checkpoint_path is not None
             else None,
@@ -682,6 +919,8 @@ def export_training_artifacts(
             "monitored_metric_policy_note": monitored_metric_policy_note,
             "train_summary": dict(train_summary) if train_summary is not None else None,
             "val_summary": dict(val_summary) if val_summary is not None else None,
+            "eval_val_summary": dict(eval_val_summary) if eval_val_summary is not None else None,
+            "eval_test_summary": dict(eval_test_summary) if eval_test_summary is not None else None,
         }
     )
     write_manifest(train_manifest_path, train_manifest)
@@ -706,7 +945,14 @@ def export_training_artifacts(
         "scheduler_name": getattr(getattr(config, "scheduler", None), "name", None),
         "scheduler_step_policy": scheduler_step_policy,
         "scheduler_last_lr": scheduler_last_lr,
+        "device_requested": runtime_device_requested,
+        "device_resolved": runtime_device_resolved,
+        "amp_requested": runtime_amp_requested,
+        "amp_used": runtime_amp_used,
+        "oom_fallbacks_applied": runtime_oom_fallbacks,
         "history_path": str(resolved_history_path) if resolved_history_path is not None else None,
+        "eval_val_path": str(resolved_eval_val_path) if resolved_eval_val_path is not None else None,
+        "eval_test_path": str(resolved_eval_test_path) if resolved_eval_test_path is not None else None,
         "epochs_completed": epochs_completed,
         "warnings": warnings_list,
         "run_id": run_id,
@@ -716,6 +962,22 @@ def export_training_artifacts(
         "monitored_metric_policy_note": monitored_metric_policy_note,
         "train": dict(train_summary) if train_summary is not None else None,
         "val": dict(val_summary) if val_summary is not None else None,
+        "eval_val": dict(eval_val_summary) if eval_val_summary is not None else None,
+        "eval_test": dict(eval_test_summary) if eval_test_summary is not None else None,
+        "best_val_metrics": (
+            {
+                "extent_f1": eval_val_summary.get("extent_f1"),
+                "extent_precision": eval_val_summary.get("extent_precision"),
+                "extent_recall": eval_val_summary.get("extent_recall"),
+                "extent_iou": eval_val_summary.get("extent_iou"),
+                "boundary_f1": eval_val_summary.get("boundary_f1"),
+                "boundary_precision": eval_val_summary.get("boundary_precision"),
+                "boundary_recall": eval_val_summary.get("boundary_recall"),
+                "boundary_skeleton_f1": eval_val_summary.get("boundary_skeleton_f1"),
+            }
+            if eval_val_summary is not None
+            else None
+        ),
     }
     write_summary(summary_path, summary_payload)
 

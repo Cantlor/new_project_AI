@@ -285,6 +285,13 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     final_manifest: Path | None = current_source_manifest
     final_summary: Path | None = None
+    stage02_manifest_path: Path | None = None
+    stage02_manifest_existing = run_dir / "02_prepare_spatial_context" / "aoi_manifest.json"
+    if stage02_manifest_existing.exists():
+        stage02_manifest_path = stage02_manifest_existing
+    feature_target_materialization_mode = (
+        "full_scene" if args.diagnostic_full_scene_materialization else "compute_spec_only"
+    )
 
     for idx in range(start_idx, stop_idx + 1):
         stage = STAGES[idx]
@@ -341,6 +348,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 aoi_metadata=aoi_metadata,
                 source_manifest_path=current_source_manifest,
                 runtime_compute_enabled=args.runtime_compute_enabled,
+                memory_budget_mb=args.memory_budget_mb,
             )
 
         elif stage.name == "03_prepare_features":
@@ -352,6 +360,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 valid_path=valid_output_path,
                 source_manifest_path=current_source_manifest,
                 runtime_compute_enabled=args.runtime_compute_enabled,
+                materialization_mode=feature_target_materialization_mode,
             )
             if result.success:
                 m03 = _load_json_object(result.manifest_path, label="stage-03 manifest")
@@ -370,6 +379,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 valid_path=valid_output_path,
                 source_manifest_path=current_source_manifest,
                 runtime_compute_enabled=args.runtime_compute_enabled,
+                materialization_mode=feature_target_materialization_mode,
             )
             if result.success:
                 m04 = _load_json_object(result.manifest_path, label="stage-04 manifest")
@@ -399,6 +409,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 distance_path=distance_output_path,
                 valid_path=valid_output_path,
                 source_manifest_path=current_source_manifest,
+                spatial_manifest_path=stage02_manifest_path,
                 runtime_compute_enabled=args.runtime_compute_enabled,
             )
 
@@ -439,6 +450,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
         final_manifest = result.manifest_path
         final_summary = result.summary_path
+        if stage.name == "02_prepare_spatial_context" and result.success:
+            stage02_manifest_path = result.manifest_path
 
         if not result.success:
             print(f"[FAIL] Pipeline stopped at {stage.name}.")
@@ -655,10 +668,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runtime-compute-enabled",
         action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable runtime compute branches in stages 02..07 (default: true). "
+            "When false, stages stay metadata/contract-driven."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-full-scene-materialization",
+        action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Enable runtime compute branches in stages 02..07 (default: false). "
-            "When false, stages stay metadata/contract-driven."
+            "Diagnostic-only flag. When true, stages 03/04 materialize full-scene "
+            "img/target rasters. Default false keeps baseline compute_spec_only."
+        ),
+    )
+    parser.add_argument(
+        "--memory-budget-mb",
+        type=int,
+        default=None,
+        help=(
+            "Optional stage-02 memory budget override in MB. "
+            "By default stage-02 auto-resolves a conservative budget."
         ),
     )
     parser.add_argument(

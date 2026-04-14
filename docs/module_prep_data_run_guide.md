@@ -87,9 +87,11 @@ cp configs/module_prep_data/baseline.raw8_idx3.yaml configs/module_prep_data/run
 - `valid_policy.compute_before_fill`: должно быть `true`.
 - `aoi.enabled`, `aoi.aoi_path`, `aoi.buffer_m`.
 - `patches.patch_size`: baseline v1 = `512`.
+- `patches.halo_px`: обязательный halo для patch-local compute.
 - `patches.sampling_policy`: `strategic` или `random`.
 - `boundary.encoding`: `background_skeleton_buffer`.
 - `distance.target`: `unsigned_distance_to_boundary`.
+- `distance.distance_clip_px`: должен удовлетворять `<= patches.halo_px`.
 - `normalization.*` (baseline robust percentiles `0.5/99.5`, scale `[0,1]`).
 - `split.policy`, `split.random_seed`.
 
@@ -158,8 +160,7 @@ export DATASET_DIR="$OUT_ROOT/$RUN_ID/06_split_dataset/dataset"
 ```bash
 BASE="python3 -m ai_fields.module_prep_data.run_pipeline \
   --config \"$CFG\" --raster \"$RASTER\" --vector \"$VECTOR\" \
-  --output-dir \"$OUT_ROOT\" --run-id \"$RUN_ID\" \
-  --runtime-compute-enabled"
+  --output-dir \"$OUT_ROOT\" --run-id \"$RUN_ID\""
 ```
 
 Если AOI используется, добавляйте `--aoi "$AOI"` в каждую команду.
@@ -205,8 +206,8 @@ eval "$BASE --start-from-stage 02_prepare_spatial_context --stop-after-stage 02_
 ### 03_prepare_features
 
 Что делает:
-- собирает feature stack (`img.tif`) и `valid.tif` (runtime mode);
-- фиксирует feature contract.
+- фиксирует feature compute spec и assembled feature contract;
+- в baseline режиме не обязан materialize full-scene `img.tif`/`valid.tif`.
 
 Команда:
 
@@ -216,19 +217,17 @@ eval "$BASE --start-from-stage 03_prepare_features --stop-after-stage 03_prepare
 
 Ключевые артефакты:
 - `.../03_prepare_features/features_manifest.json`
-- `.../03_prepare_features/img.tif`
-- `.../03_prepare_features/valid.tif`
 
 Что проверить:
 - `feature_mode` правильный;
 - `feature_channel_count` = 8 (`raw8`) или 11 (`raw8_idx3`);
-- `valid_output_path` не пустой.
+- `materialization_mode=compute_spec_only` в baseline.
 
 ### 04_prepare_targets
 
 Что делает:
-- генерирует target rasters (`extent`, `boundary`, `boundary_raw`, `distance`, `valid`) в runtime mode;
-- фиксирует target contract.
+- фиксирует target compute spec и target policies;
+- в baseline режиме не обязан materialize full-scene target rasters.
 
 Команда:
 
@@ -238,21 +237,18 @@ eval "$BASE --start-from-stage 04_prepare_targets --stop-after-stage 04_prepare_
 
 Ключевые артефакты:
 - `.../04_prepare_targets/targets_manifest.json`
-- `.../04_prepare_targets/extent.tif`
-- `.../04_prepare_targets/boundary.tif`
-- `.../04_prepare_targets/boundary_raw.tif`
-- `.../04_prepare_targets/distance.tif`
-- `.../04_prepare_targets/valid.tif` (если не был передан precomputed valid)
 
 Что проверить:
 - `boundary_encoding=background_skeleton_buffer`;
 - `distance_target=unsigned_distance_to_boundary`;
+- `materialization_mode=compute_spec_only` в baseline;
 - `status=success`.
 
 ### 05_make_patches
 
 Что делает:
-- режет патчи и пишет patch-level слои + meta.
+- главный materializer train-ready samples из canonical source Stage 02;
+- локально считает features/targets на `patch+halo` и экспортирует центральный patch.
 
 Команда:
 
@@ -267,14 +263,15 @@ eval "$BASE --start-from-stage 05_make_patches --stop-after-stage 05_make_patche
 
 Что проверить:
 - `written_total > 0` (если `0`, дальше split практически бессмысленен);
-- `patch_contract_mode=runtime_compute`.
+- `patch_contract_mode=patch_first_from_source`;
+- `patch_runtime_mode=patch_first_from_source`.
 
 ### 06_split_dataset
 
 Что делает:
 - назначает `train/val/test`;
 - материализует train-ready layout;
-- считает `norm_stats.json`.
+- считает `norm_stats.json` потоково (bounded-memory, exact fallback для малых наборов).
 
 Команда:
 
@@ -290,7 +287,9 @@ eval "$BASE --start-from-stage 06_split_dataset --stop-after-stage 06_split_data
 Что проверить:
 - `export_layout_materialized=true`;
 - в каждом split есть подпапки `img/extent/boundary/distance/valid/meta`;
-- `norm_stats.json` существует.
+- `norm_stats.json` существует;
+- в `split_manifest.json` заполнен блок `normalization_stats`
+  (`method`, `approximation`, `rng_seed`).
 
 ### 07_validate_outputs
 
@@ -468,4 +467,4 @@ dataset/
 
 - В `MANIFEST_SCHEMAS.md` для `module_prep_data` описаны не все stage manifests, которые реально пишет код (`targets_manifest.json`, `validate_outputs_manifest.json` уже есть в реализации).
 - В ТЗ упомянуты band order/band mapping как конфигурируемые; в текущей реализации runtime feature compute использует фиксированный порядок каналов, отдельного ключа band mapping в YAML schema нет.
-- В `run_pipeline` по умолчанию `--runtime-compute-enabled` выключен (`false`), поэтому без явного флага стадии 02..07 остаются metadata/contract-driven и не строят полноценный train-ready dataset.
+- В `run_pipeline` по умолчанию `--runtime-compute-enabled` включен (`true`), а baseline Stage 03/04 работает как `compute_spec_only`; full-scene materialization включается только через `--diagnostic-full-scene-materialization`.

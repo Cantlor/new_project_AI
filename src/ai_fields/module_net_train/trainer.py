@@ -39,13 +39,59 @@ def _resolve_device(requested_device: str | None = None) -> "torch.device":
     """Resolve runtime device with CUDA -> MPS -> CPU fallback order."""
     _require_torch()
     if requested_device is not None:
-        return torch.device(requested_device)
+        if requested_device == "cuda":
+            if not torch.cuda.is_available():
+                raise ContractError(
+                    "Requested training.device='cuda', but CUDA is not available."
+                )
+            return torch.device("cuda")
+        if requested_device == "mps":
+            mps = getattr(torch.backends, "mps", None)
+            if mps is None or not mps.is_available():
+                raise ContractError(
+                    "Requested training.device='mps', but MPS is not available."
+                )
+            return torch.device("mps")
+        if requested_device == "cpu":
+            return torch.device("cpu")
+        raise ContractError(
+            "requested_device must be one of {'cuda', 'mps', 'cpu'} or null, "
+            f"got {requested_device!r}."
+        )
     if torch.cuda.is_available():
         return torch.device("cuda")
     mps = getattr(torch.backends, "mps", None)
     if mps is not None and mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def resolve_runtime_execution(
+    *,
+    requested_device: str | None,
+    amp_requested: bool,
+) -> dict[str, Any]:
+    """Resolve runtime execution policy for device and AMP usage."""
+    _require_torch()
+    if requested_device is not None and not isinstance(requested_device, str):
+        raise ContractError(
+            "requested_device must be a string or null, "
+            f"got {type(requested_device).__name__}."
+        )
+    if not isinstance(amp_requested, bool):
+        raise ContractError(
+            f"amp_requested must be a boolean, got {type(amp_requested).__name__}."
+        )
+
+    resolved_device = _resolve_device(requested_device)
+    amp_used = bool(amp_requested and resolved_device.type == "cuda")
+    return {
+        "device_requested": requested_device,
+        "device_resolved": str(resolved_device),
+        "amp_requested": amp_requested,
+        "amp_used": amp_used,
+        "resolved_device": resolved_device,
+    }
 
 
 def _autocast_context(*, amp_enabled: bool, device: "torch.device") -> Any:
@@ -252,7 +298,7 @@ def _require_pred_heads(preds: Mapping[str, Any], *, where: str) -> None:
             )
 
 
-def _binary_f1_counts(
+def _binary_counts(
     *,
     pred_positive: "torch.Tensor",
     target_positive: "torch.Tensor",
@@ -269,6 +315,20 @@ def _binary_f1_counts(
     return tp, fp, fn
 
 
+def _precision_from_counts(*, tp: int, fp: int) -> float:
+    denom = tp + fp
+    if denom <= 0:
+        return 0.0
+    return float(tp) / float(denom)
+
+
+def _recall_from_counts(*, tp: int, fn: int) -> float:
+    denom = tp + fn
+    if denom <= 0:
+        return 0.0
+    return float(tp) / float(denom)
+
+
 def _f1_from_counts(*, tp: int, fp: int, fn: int) -> float:
     denom = (2 * tp) + fp + fn
     if denom <= 0:
@@ -276,20 +336,31 @@ def _f1_from_counts(*, tp: int, fp: int, fn: int) -> float:
     return float((2.0 * tp) / float(denom))
 
 
-def _compute_batch_f1_counts(
+def _iou_from_counts(*, tp: int, fp: int, fn: int) -> float:
+    denom = tp + fp + fn
+    if denom <= 0:
+        return 0.0
+    return float(tp) / float(denom)
+
+
+def _macro2(a: float, b: float) -> float:
+    return 0.5 * (float(a) + float(b))
+
+
+def _compute_batch_metric_counts(
     *,
     preds: Mapping[str, "torch.Tensor"],
     targets: Mapping[str, "torch.Tensor"],
     valid_mask: "torch.Tensor",
 ) -> dict[str, int]:
-    """Compute minimal valid-aware batch F1 counts for extent and boundary."""
+    """Compute valid-aware segmentation counts for extent and boundary classes."""
     extent_logits = preds["extent"]
     if extent_logits.dim() == 4 and extent_logits.shape[1] == 1:
         extent_logits = extent_logits.squeeze(1)
     extent_pred_positive = extent_logits.detach() >= 0.0
     extent_target_positive = targets["extent"] == 1
     extent_effective_mask = valid_mask & (targets["extent"] != EXTENT_IGNORE_LABEL)
-    extent_tp, extent_fp, extent_fn = _binary_f1_counts(
+    extent_tp, extent_fp, extent_fn = _binary_counts(
         pred_positive=extent_pred_positive,
         target_positive=extent_target_positive,
         mask=extent_effective_mask,
@@ -300,11 +371,23 @@ def _compute_batch_f1_counts(
         raise ContractError(
             "boundary prediction tensor must have shape (B, C, H, W) with C>=2."
         )
-    boundary_pred_positive = boundary_logits.detach().argmax(dim=1) != 0
-    boundary_target_positive = targets["boundary"] != 0
-    boundary_tp, boundary_fp, boundary_fn = _binary_f1_counts(
-        pred_positive=boundary_pred_positive,
-        target_positive=boundary_target_positive,
+
+    boundary_pred = boundary_logits.detach().argmax(dim=1)
+    boundary_target = targets["boundary"]
+
+    boundary_any_tp, boundary_any_fp, boundary_any_fn = _binary_counts(
+        pred_positive=boundary_pred != 0,
+        target_positive=boundary_target != 0,
+        mask=valid_mask,
+    )
+    boundary_skeleton_tp, boundary_skeleton_fp, boundary_skeleton_fn = _binary_counts(
+        pred_positive=boundary_pred == 1,
+        target_positive=boundary_target == 1,
+        mask=valid_mask,
+    )
+    boundary_buffer_tp, boundary_buffer_fp, boundary_buffer_fn = _binary_counts(
+        pred_positive=boundary_pred == 2,
+        target_positive=boundary_target == 2,
         mask=valid_mask,
     )
 
@@ -312,9 +395,15 @@ def _compute_batch_f1_counts(
         "extent_tp": extent_tp,
         "extent_fp": extent_fp,
         "extent_fn": extent_fn,
-        "boundary_tp": boundary_tp,
-        "boundary_fp": boundary_fp,
-        "boundary_fn": boundary_fn,
+        "boundary_any_tp": boundary_any_tp,
+        "boundary_any_fp": boundary_any_fp,
+        "boundary_any_fn": boundary_any_fn,
+        "boundary_skeleton_tp": boundary_skeleton_tp,
+        "boundary_skeleton_fp": boundary_skeleton_fp,
+        "boundary_skeleton_fn": boundary_skeleton_fn,
+        "boundary_buffer_tp": boundary_buffer_tp,
+        "boundary_buffer_fp": boundary_buffer_fp,
+        "boundary_buffer_fn": boundary_buffer_fn,
     }
 
 
@@ -400,7 +489,7 @@ def _compute_losses(
                 f"model output 'aux' must be a list (or null), got {type(aux_raw).__name__}."
             )
 
-    f1_counts = _compute_batch_f1_counts(preds=main_preds, targets=targets, valid_mask=valid_mask)
+    metric_counts = _compute_batch_metric_counts(preds=main_preds, targets=targets, valid_mask=valid_mask)
     n_valid = int(main_losses["n_valid"])
     return (
         {
@@ -413,7 +502,7 @@ def _compute_losses(
         n_valid,
         batch_size,
         n_aux,
-        f1_counts,
+        metric_counts,
     )
 
 
@@ -424,8 +513,37 @@ def _loss_tensors_to_result(
     n_batches: int,
     n_samples: int,
     n_aux: int,
-    f1_counts: Mapping[str, int],
+    metric_counts: Mapping[str, int],
 ) -> dict[str, Any]:
+    extent_tp = int(metric_counts["extent_tp"])
+    extent_fp = int(metric_counts["extent_fp"])
+    extent_fn = int(metric_counts["extent_fn"])
+
+    boundary_skel_tp = int(metric_counts["boundary_skeleton_tp"])
+    boundary_skel_fp = int(metric_counts["boundary_skeleton_fp"])
+    boundary_skel_fn = int(metric_counts["boundary_skeleton_fn"])
+    boundary_buf_tp = int(metric_counts["boundary_buffer_tp"])
+    boundary_buf_fp = int(metric_counts["boundary_buffer_fp"])
+    boundary_buf_fn = int(metric_counts["boundary_buffer_fn"])
+    boundary_any_tp = int(metric_counts["boundary_any_tp"])
+    boundary_any_fp = int(metric_counts["boundary_any_fp"])
+    boundary_any_fn = int(metric_counts["boundary_any_fn"])
+
+    extent_precision = _precision_from_counts(tp=extent_tp, fp=extent_fp)
+    extent_recall = _recall_from_counts(tp=extent_tp, fn=extent_fn)
+    extent_iou = _iou_from_counts(tp=extent_tp, fp=extent_fp, fn=extent_fn)
+    extent_f1 = _f1_from_counts(tp=extent_tp, fp=extent_fp, fn=extent_fn)
+
+    boundary_skel_precision = _precision_from_counts(tp=boundary_skel_tp, fp=boundary_skel_fp)
+    boundary_skel_recall = _recall_from_counts(tp=boundary_skel_tp, fn=boundary_skel_fn)
+    boundary_skel_f1 = _f1_from_counts(tp=boundary_skel_tp, fp=boundary_skel_fp, fn=boundary_skel_fn)
+    boundary_buf_precision = _precision_from_counts(tp=boundary_buf_tp, fp=boundary_buf_fp)
+    boundary_buf_recall = _recall_from_counts(tp=boundary_buf_tp, fn=boundary_buf_fn)
+    boundary_buf_f1 = _f1_from_counts(tp=boundary_buf_tp, fp=boundary_buf_fp, fn=boundary_buf_fn)
+    boundary_any_precision = _precision_from_counts(tp=boundary_any_tp, fp=boundary_any_fp)
+    boundary_any_recall = _recall_from_counts(tp=boundary_any_tp, fn=boundary_any_fn)
+    boundary_any_f1 = _f1_from_counts(tp=boundary_any_tp, fp=boundary_any_fp, fn=boundary_any_fn)
+
     return {
         "extent": float(losses["extent"].detach().item()),
         "boundary": float(losses["boundary"].detach().item()),
@@ -436,16 +554,22 @@ def _loss_tensors_to_result(
         "n_batches": int(n_batches),
         "n_samples": int(n_samples),
         "n_aux": int(n_aux),
-        "extent_f1": _f1_from_counts(
-            tp=int(f1_counts["extent_tp"]),
-            fp=int(f1_counts["extent_fp"]),
-            fn=int(f1_counts["extent_fn"]),
-        ),
-        "boundary_f1": _f1_from_counts(
-            tp=int(f1_counts["boundary_tp"]),
-            fp=int(f1_counts["boundary_fp"]),
-            fn=int(f1_counts["boundary_fn"]),
-        ),
+        "extent_precision": extent_precision,
+        "extent_recall": extent_recall,
+        "extent_iou": extent_iou,
+        "extent_f1": extent_f1,
+        "boundary_precision": _macro2(boundary_skel_precision, boundary_buf_precision),
+        "boundary_recall": _macro2(boundary_skel_recall, boundary_buf_recall),
+        "boundary_f1": _macro2(boundary_skel_f1, boundary_buf_f1),
+        "boundary_skeleton_precision": boundary_skel_precision,
+        "boundary_skeleton_recall": boundary_skel_recall,
+        "boundary_skeleton_f1": boundary_skel_f1,
+        "boundary_buffer_precision": boundary_buf_precision,
+        "boundary_buffer_recall": boundary_buf_recall,
+        "boundary_buffer_f1": boundary_buf_f1,
+        "boundary_any_precision": boundary_any_precision,
+        "boundary_any_recall": boundary_any_recall,
+        "boundary_any_f1": boundary_any_f1,
     }
 
 
@@ -468,7 +592,7 @@ def train_step(
     model.train()
 
     optimizer.zero_grad(set_to_none=True)
-    losses, n_valid, batch_size, n_aux, f1_counts = _compute_losses(
+    losses, n_valid, batch_size, n_aux, metric_counts = _compute_losses(
         model,
         loss_fn,
         _require_batch_dict(batch),
@@ -488,7 +612,7 @@ def train_step(
         n_batches=1,
         n_samples=batch_size,
         n_aux=n_aux,
-        f1_counts=f1_counts,
+        metric_counts=metric_counts,
     )
 
 
@@ -534,13 +658,19 @@ def train_one_epoch(
     total_samples = 0
     n_batches = 0
     n_aux = 0
-    f1_counts = {
+    metric_counts = {
         "extent_tp": 0,
         "extent_fp": 0,
         "extent_fn": 0,
-        "boundary_tp": 0,
-        "boundary_fp": 0,
-        "boundary_fn": 0,
+        "boundary_any_tp": 0,
+        "boundary_any_fp": 0,
+        "boundary_any_fn": 0,
+        "boundary_skeleton_tp": 0,
+        "boundary_skeleton_fp": 0,
+        "boundary_skeleton_fn": 0,
+        "boundary_buffer_tp": 0,
+        "boundary_buffer_fp": 0,
+        "boundary_buffer_fn": 0,
     }
 
     _dl_len = getattr(dataloader, "__len__", None)
@@ -554,7 +684,7 @@ def train_one_epoch(
         leave=False,
     ) as bar:
         for step_idx, batch in enumerate(dataloader, start=1):
-            losses, n_valid, batch_size, batch_aux_count, batch_f1_counts = _compute_losses(
+            losses, n_valid, batch_size, batch_aux_count, batch_metric_counts = _compute_losses(
                 model,
                 loss_fn,
                 _require_batch_dict(batch),
@@ -586,11 +716,17 @@ def train_one_epoch(
                 "extent_tp",
                 "extent_fp",
                 "extent_fn",
-                "boundary_tp",
-                "boundary_fp",
-                "boundary_fn",
+                "boundary_any_tp",
+                "boundary_any_fp",
+                "boundary_any_fn",
+                "boundary_skeleton_tp",
+                "boundary_skeleton_fp",
+                "boundary_skeleton_fn",
+                "boundary_buffer_tp",
+                "boundary_buffer_fp",
+                "boundary_buffer_fn",
             ):
-                f1_counts[key] += int(batch_f1_counts[key])
+                metric_counts[key] += int(batch_metric_counts[key])
 
             bar.update(1)
             bar.set_postfix(loss=f"{agg['total'] / n_batches:.4f}")
@@ -606,6 +742,33 @@ def train_one_epoch(
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+    extent_tp = metric_counts["extent_tp"]
+    extent_fp = metric_counts["extent_fp"]
+    extent_fn = metric_counts["extent_fn"]
+    boundary_skel_tp = metric_counts["boundary_skeleton_tp"]
+    boundary_skel_fp = metric_counts["boundary_skeleton_fp"]
+    boundary_skel_fn = metric_counts["boundary_skeleton_fn"]
+    boundary_buf_tp = metric_counts["boundary_buffer_tp"]
+    boundary_buf_fp = metric_counts["boundary_buffer_fp"]
+    boundary_buf_fn = metric_counts["boundary_buffer_fn"]
+    boundary_any_tp = metric_counts["boundary_any_tp"]
+    boundary_any_fp = metric_counts["boundary_any_fp"]
+    boundary_any_fn = metric_counts["boundary_any_fn"]
+
+    extent_precision = _precision_from_counts(tp=extent_tp, fp=extent_fp)
+    extent_recall = _recall_from_counts(tp=extent_tp, fn=extent_fn)
+    extent_iou = _iou_from_counts(tp=extent_tp, fp=extent_fp, fn=extent_fn)
+    extent_f1 = _f1_from_counts(tp=extent_tp, fp=extent_fp, fn=extent_fn)
+    boundary_skel_precision = _precision_from_counts(tp=boundary_skel_tp, fp=boundary_skel_fp)
+    boundary_skel_recall = _recall_from_counts(tp=boundary_skel_tp, fn=boundary_skel_fn)
+    boundary_skel_f1 = _f1_from_counts(tp=boundary_skel_tp, fp=boundary_skel_fp, fn=boundary_skel_fn)
+    boundary_buf_precision = _precision_from_counts(tp=boundary_buf_tp, fp=boundary_buf_fp)
+    boundary_buf_recall = _recall_from_counts(tp=boundary_buf_tp, fn=boundary_buf_fn)
+    boundary_buf_f1 = _f1_from_counts(tp=boundary_buf_tp, fp=boundary_buf_fp, fn=boundary_buf_fn)
+    boundary_any_precision = _precision_from_counts(tp=boundary_any_tp, fp=boundary_any_fp)
+    boundary_any_recall = _recall_from_counts(tp=boundary_any_tp, fn=boundary_any_fn)
+    boundary_any_f1 = _f1_from_counts(tp=boundary_any_tp, fp=boundary_any_fp, fn=boundary_any_fn)
+
     return {
         "extent": agg["extent"] / n_batches,
         "boundary": agg["boundary"] / n_batches,
@@ -616,16 +779,22 @@ def train_one_epoch(
         "n_batches": n_batches,
         "n_samples": total_samples,
         "n_aux": n_aux,
-        "extent_f1": _f1_from_counts(
-            tp=f1_counts["extent_tp"],
-            fp=f1_counts["extent_fp"],
-            fn=f1_counts["extent_fn"],
-        ),
-        "boundary_f1": _f1_from_counts(
-            tp=f1_counts["boundary_tp"],
-            fp=f1_counts["boundary_fp"],
-            fn=f1_counts["boundary_fn"],
-        ),
+        "extent_precision": extent_precision,
+        "extent_recall": extent_recall,
+        "extent_iou": extent_iou,
+        "extent_f1": extent_f1,
+        "boundary_precision": _macro2(boundary_skel_precision, boundary_buf_precision),
+        "boundary_recall": _macro2(boundary_skel_recall, boundary_buf_recall),
+        "boundary_f1": _macro2(boundary_skel_f1, boundary_buf_f1),
+        "boundary_skeleton_precision": boundary_skel_precision,
+        "boundary_skeleton_recall": boundary_skel_recall,
+        "boundary_skeleton_f1": boundary_skel_f1,
+        "boundary_buffer_precision": boundary_buf_precision,
+        "boundary_buffer_recall": boundary_buf_recall,
+        "boundary_buffer_f1": boundary_buf_f1,
+        "boundary_any_precision": boundary_any_precision,
+        "boundary_any_recall": boundary_any_recall,
+        "boundary_any_f1": boundary_any_f1,
     }
 
 
@@ -657,13 +826,19 @@ def evaluate_one_epoch(
     total_samples = 0
     n_batches = 0
     n_aux = 0
-    f1_counts = {
+    metric_counts = {
         "extent_tp": 0,
         "extent_fp": 0,
         "extent_fn": 0,
-        "boundary_tp": 0,
-        "boundary_fp": 0,
-        "boundary_fn": 0,
+        "boundary_any_tp": 0,
+        "boundary_any_fp": 0,
+        "boundary_any_fn": 0,
+        "boundary_skeleton_tp": 0,
+        "boundary_skeleton_fp": 0,
+        "boundary_skeleton_fn": 0,
+        "boundary_buffer_tp": 0,
+        "boundary_buffer_fp": 0,
+        "boundary_buffer_fn": 0,
     }
 
     _dl_len = getattr(dataloader, "__len__", None)
@@ -677,7 +852,7 @@ def evaluate_one_epoch(
         leave=False,
     ) as bar:
         for batch in dataloader:
-            losses, n_valid, batch_size, batch_aux_count, batch_f1_counts = _compute_losses(
+            losses, n_valid, batch_size, batch_aux_count, batch_metric_counts = _compute_losses(
                 model,
                 loss_fn,
                 _require_batch_dict(batch),
@@ -698,17 +873,50 @@ def evaluate_one_epoch(
                 "extent_tp",
                 "extent_fp",
                 "extent_fn",
-                "boundary_tp",
-                "boundary_fp",
-                "boundary_fn",
+                "boundary_any_tp",
+                "boundary_any_fp",
+                "boundary_any_fn",
+                "boundary_skeleton_tp",
+                "boundary_skeleton_fp",
+                "boundary_skeleton_fn",
+                "boundary_buffer_tp",
+                "boundary_buffer_fp",
+                "boundary_buffer_fn",
             ):
-                f1_counts[key] += int(batch_f1_counts[key])
+                metric_counts[key] += int(batch_metric_counts[key])
 
             bar.update(1)
             bar.set_postfix(loss=f"{agg['total'] / n_batches:.4f}")
 
     if n_batches == 0:
         raise ContractError("evaluate_one_epoch received an empty dataloader.")
+
+    extent_tp = metric_counts["extent_tp"]
+    extent_fp = metric_counts["extent_fp"]
+    extent_fn = metric_counts["extent_fn"]
+    boundary_skel_tp = metric_counts["boundary_skeleton_tp"]
+    boundary_skel_fp = metric_counts["boundary_skeleton_fp"]
+    boundary_skel_fn = metric_counts["boundary_skeleton_fn"]
+    boundary_buf_tp = metric_counts["boundary_buffer_tp"]
+    boundary_buf_fp = metric_counts["boundary_buffer_fp"]
+    boundary_buf_fn = metric_counts["boundary_buffer_fn"]
+    boundary_any_tp = metric_counts["boundary_any_tp"]
+    boundary_any_fp = metric_counts["boundary_any_fp"]
+    boundary_any_fn = metric_counts["boundary_any_fn"]
+
+    extent_precision = _precision_from_counts(tp=extent_tp, fp=extent_fp)
+    extent_recall = _recall_from_counts(tp=extent_tp, fn=extent_fn)
+    extent_iou = _iou_from_counts(tp=extent_tp, fp=extent_fp, fn=extent_fn)
+    extent_f1 = _f1_from_counts(tp=extent_tp, fp=extent_fp, fn=extent_fn)
+    boundary_skel_precision = _precision_from_counts(tp=boundary_skel_tp, fp=boundary_skel_fp)
+    boundary_skel_recall = _recall_from_counts(tp=boundary_skel_tp, fn=boundary_skel_fn)
+    boundary_skel_f1 = _f1_from_counts(tp=boundary_skel_tp, fp=boundary_skel_fp, fn=boundary_skel_fn)
+    boundary_buf_precision = _precision_from_counts(tp=boundary_buf_tp, fp=boundary_buf_fp)
+    boundary_buf_recall = _recall_from_counts(tp=boundary_buf_tp, fn=boundary_buf_fn)
+    boundary_buf_f1 = _f1_from_counts(tp=boundary_buf_tp, fp=boundary_buf_fp, fn=boundary_buf_fn)
+    boundary_any_precision = _precision_from_counts(tp=boundary_any_tp, fp=boundary_any_fp)
+    boundary_any_recall = _recall_from_counts(tp=boundary_any_tp, fn=boundary_any_fn)
+    boundary_any_f1 = _f1_from_counts(tp=boundary_any_tp, fp=boundary_any_fp, fn=boundary_any_fn)
 
     return {
         "extent": agg["extent"] / n_batches,
@@ -720,15 +928,21 @@ def evaluate_one_epoch(
         "n_batches": n_batches,
         "n_samples": total_samples,
         "n_aux": n_aux,
-        "extent_f1": _f1_from_counts(
-            tp=f1_counts["extent_tp"],
-            fp=f1_counts["extent_fp"],
-            fn=f1_counts["extent_fn"],
-        ),
-        "boundary_f1": _f1_from_counts(
-            tp=f1_counts["boundary_tp"],
-            fp=f1_counts["boundary_fp"],
-            fn=f1_counts["boundary_fn"],
-        ),
+        "extent_precision": extent_precision,
+        "extent_recall": extent_recall,
+        "extent_iou": extent_iou,
+        "extent_f1": extent_f1,
+        "boundary_precision": _macro2(boundary_skel_precision, boundary_buf_precision),
+        "boundary_recall": _macro2(boundary_skel_recall, boundary_buf_recall),
+        "boundary_f1": _macro2(boundary_skel_f1, boundary_buf_f1),
+        "boundary_skeleton_precision": boundary_skel_precision,
+        "boundary_skeleton_recall": boundary_skel_recall,
+        "boundary_skeleton_f1": boundary_skel_f1,
+        "boundary_buffer_precision": boundary_buf_precision,
+        "boundary_buffer_recall": boundary_buf_recall,
+        "boundary_buffer_f1": boundary_buf_f1,
+        "boundary_any_precision": boundary_any_precision,
+        "boundary_any_recall": boundary_any_recall,
+        "boundary_any_f1": boundary_any_f1,
     }
     

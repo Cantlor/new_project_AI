@@ -58,6 +58,9 @@ class PrepareSpatialContextStageResult:
     # Expose resolved spatial artifacts so the orchestrator can reference them
     # without re-reading the manifest JSON.
     aoi_output_path: Path | None = None
+    vector_runtime_path: Path | None = None
+    source_path: Path | None = None
+    source_kind: str | None = None
     effective_extent_bounds: tuple[float, float, float, float] | None = None
     aoi_source_type: str | None = None  # "user_provided" | "derived_from_labels" | None
     aoi_derivation_method: str | None = None  # "labels_bbox_buffered" | None
@@ -171,20 +174,35 @@ def _resolve_spatial_contract(
         aoi_metadata=aoi_metadata,
     )
 
-    aoi_present = paths["aoi_path"] is not None
+    aoi_user_provided = paths["aoi_path"] is not None
+    aoi_derive_mode = resolved_config.aoi.derive_from_labels_if_missing
     aoi_policy_enabled = resolved_config.aoi.enabled
 
-    if aoi_present and not aoi_policy_enabled:
+    # user-provided AOI: aoi_path must match enabled=True
+    if aoi_user_provided and not aoi_policy_enabled:
         raise ContractError(
             "AOI contract violation: aoi_path was provided but config.aoi.enabled is False."
         )
-    if aoi_policy_enabled and not aoi_present:
+    if aoi_policy_enabled and not aoi_user_provided:
         raise ContractError(
             "AOI contract violation: config.aoi.enabled is True but aoi_path is not provided."
         )
-    if aoi_present and aoi_metadata is None:
+
+    # derive mode requires no aoi_path; the enabled+derive conflict is already
+    # validated in AoiConfig.validate(), so no duplicate check here.
+    aoi_present = aoi_user_provided or aoi_derive_mode
+    aoi_source_type: str | None = (
+        "user_provided"
+        if aoi_user_provided
+        else "derived_from_labels"
+        if aoi_derive_mode
+        else None
+    )
+
+    # metadata required only for user-provided AOI
+    if aoi_user_provided and aoi_metadata is None:
         raise ContractError("aoi_metadata is required when aoi_path is provided.")
-    if not aoi_present and aoi_metadata is not None:
+    if not aoi_user_provided and aoi_metadata is not None:
         raise ContractError("aoi_metadata must be null when aoi_path is not provided.")
 
     if aoi_metadata is not None:
@@ -267,6 +285,7 @@ def run_prepare_spatial_context_stage(
     source_manifest_path: str | Path | None = None,
     module_version: str | None = None,
     runtime_compute_enabled: bool = True,
+    memory_budget_mb: int | None = None,
 ) -> PrepareSpatialContextStageResult:
     """Run lightweight `02_prepare_spatial_context` stage and write artifacts.
 
@@ -302,7 +321,7 @@ def run_prepare_spatial_context_stage(
     vector_reprojection_required: bool | None = None
     aoi_reprojection_required: bool | None = None
     vector_reprojected: bool | None = None
-    vector_output_path: str | None = None
+    vector_runtime_path: str | None = None
     aoi_output_path: str | None = None
     effective_extent_bounds: list[float] | None = None
     aoi_bounds_metadata_hint: list[float] | None = None
@@ -311,6 +330,14 @@ def run_prepare_spatial_context_stage(
     aoi_reprojected: bool | None = None
     aoi_source_type: str | None = None
     aoi_derivation_method: str | None = None
+    source_kind: str | None = None
+    source_path: str | None = None
+    source_is_tiled: bool | None = None
+    source_block_shapes: list[list[int]] | None = None
+    memory_budget_mb: int | None = None
+    large_scene_mode: bool | None = None
+    auto_mode_reason: str | None = None
+    full_scene_materialization_allowed: bool | None = None
     derive_aoi_from_labels_if_missing = False
 
     try:
@@ -361,10 +388,11 @@ def run_prepare_spatial_context_stage(
                 buffer_m=float(resolved_buffer_m) if resolved_buffer_m is not None else 0.0,
                 output_dir=output_root,
                 derive_aoi_from_labels=derive_aoi_from_labels_if_missing,
+                memory_budget_mb=memory_budget_mb,
             )
             effective_extent_bounds = compute_result["effective_extent_bounds"]
             vector_reprojected = compute_result["vector_reprojected"]
-            vector_output_path = compute_result.get("vector_reprojected_path")
+            vector_runtime_path = compute_result.get("vector_runtime_path")
             aoi_reprojected = compute_result["aoi_reprojected"]
             aoi_output_path = compute_result.get("aoi_reprojected_path")
             aoi_derivation_method = compute_result.get("aoi_derivation_method")
@@ -373,6 +401,16 @@ def run_prepare_spatial_context_stage(
             vector_target_crs = compute_result["raster_crs"]
             aoi_source_crs = compute_result.get("aoi_crs_source") or aoi_source_crs
             aoi_target_crs = compute_result["raster_crs"]
+            source_kind = compute_result.get("source_kind")
+            source_path = compute_result.get("source_path")
+            source_is_tiled = compute_result.get("is_tiled")
+            source_block_shapes = compute_result.get("block_shapes")
+            memory_budget_mb = compute_result.get("memory_budget_mb")
+            large_scene_mode = compute_result.get("large_scene_mode")
+            auto_mode_reason = compute_result.get("auto_mode_reason")
+            full_scene_materialization_allowed = compute_result.get(
+                "full_scene_materialization_allowed"
+            )
             resolved_aoi_source_type = compute_result.get("aoi_source_type")
             if resolved_aoi_source_type in {"user_provided", "derived_from_labels"}:
                 aoi_source_type = resolved_aoi_source_type
@@ -418,6 +456,7 @@ def run_prepare_spatial_context_stage(
             "feature_mode": None if resolved_config is None else resolved_config.feature_mode,
             "runtime_compute_enabled": runtime_compute_enabled,
             "spatial_compute_mode": spatial_compute_mode,
+            "memory_budget_mb_override": memory_budget_mb,
         },
         "provenance": {
             "source_run_ids": [],
@@ -454,14 +493,14 @@ def run_prepare_spatial_context_stage(
                     *(
                         [
                             {
-                                "path": vector_output_path,
-                                "role": "vector_in_raster_crs",
+                                "path": vector_runtime_path,
+                                "role": "vector_runtime_in_raster_crs",
                                 "format": "GPKG",
                                 "is_required": False,
                                 "exists": True,
                             }
                         ]
-                        if vector_output_path is not None
+                        if vector_runtime_path is not None
                         else []
                     ),
                     *(
@@ -494,7 +533,7 @@ def run_prepare_spatial_context_stage(
                 "vector_target_crs": vector_target_crs,
                 "vector_reprojection_required": vector_reprojection_required,
                 "vector_reprojection_applied": vector_reprojected,
-                "vector_output_path": vector_output_path,
+                "vector_runtime_path": vector_runtime_path,
                 "aoi_present": aoi_present,
                 "aoi_policy_enabled": aoi_policy_enabled,
                 "aoi_buffer_m": resolved_buffer_m,
@@ -507,6 +546,14 @@ def run_prepare_spatial_context_stage(
                 "aoi_output_path": aoi_output_path,
                 "aoi_bounds_metadata_hint": aoi_bounds_metadata_hint,
                 "effective_extent_bounds": effective_extent_bounds,
+                "source_kind": source_kind,
+                "source_path": source_path,
+                "is_tiled": source_is_tiled,
+                "block_shapes": source_block_shapes,
+                "memory_budget_mb": memory_budget_mb,
+                "large_scene_mode": large_scene_mode,
+                "auto_mode_reason": auto_mode_reason,
+                "full_scene_materialization_allowed": full_scene_materialization_allowed,
             },
             "features": {},
             "valid_policy": {},
@@ -535,12 +582,20 @@ def run_prepare_spatial_context_stage(
         "vector_source_crs": vector_source_crs,
         "vector_target_crs": vector_target_crs,
         "vector_reprojected": vector_reprojected,
-        "vector_output_path": vector_output_path,
+        "vector_runtime_path": vector_runtime_path,
         "aoi_output_path": aoi_output_path,
         "buffer_m": resolved_buffer_m,
         "aoi_bounds_metadata_hint": aoi_bounds_metadata_hint,
         "effective_extent_bounds": effective_extent_bounds,
         "spatial_context_mode": spatial_context_mode,
+        "source_kind": source_kind,
+        "source_path": source_path,
+        "is_tiled": source_is_tiled,
+        "block_shapes": source_block_shapes,
+        "memory_budget_mb": memory_budget_mb,
+        "large_scene_mode": large_scene_mode,
+        "auto_mode_reason": auto_mode_reason,
+        "full_scene_materialization_allowed": full_scene_materialization_allowed,
         "checks": checks,
         "diagnostics": {
             "warnings": (
@@ -593,6 +648,9 @@ def run_prepare_spatial_context_stage(
         error_type=error_type,
         error_message=error_message,
         aoi_output_path=Path(aoi_output_path) if aoi_output_path else None,
+        vector_runtime_path=Path(vector_runtime_path) if vector_runtime_path else None,
+        source_path=Path(source_path) if source_path else None,
+        source_kind=source_kind,
         effective_extent_bounds=(
             tuple(effective_extent_bounds)  # type: ignore[arg-type]
             if effective_extent_bounds

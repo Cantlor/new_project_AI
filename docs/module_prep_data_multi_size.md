@@ -13,6 +13,11 @@
 
 Смешивание размеров внутри одного train/val/test экспорта не допускается.
 
+Важно для текущего baseline:
+- Stage 03/04 по умолчанию работают в `compute_spec_only`;
+- основной materializer train-ready датасета — Stage 05 (`patch_first_from_source`);
+- peak RAM в runtime не должен зависеть от полного размера сцены.
+
 ## Команды
 
 ### 1) Single-size (как раньше)

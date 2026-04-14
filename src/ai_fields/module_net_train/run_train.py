@@ -30,15 +30,15 @@ from ai_fields.module_net_train.export import (
 from ai_fields.module_net_train.losses import MultitaskLoss
 from ai_fields.module_net_train.model import build_model
 from ai_fields.module_net_train.schemas import (
+    DEPRECATED_MONITORED_METRIC_NAMES,
     MONITORED_METRIC_COMPOSITE_BOUNDARY_EXTENT_F1,
-    MONITORED_METRIC_COMPOSITE_BOUNDARY_F1_EXTENT_F1,
     MONITORED_METRIC_EXPECTED_MODE,
-    MONITORED_METRIC_INTERIM_VAL_TOTAL_LOSS,
 )
 from ai_fields.module_net_train.trainer import (
     build_scheduler,
     build_optimizer,
     evaluate_one_epoch,
+    resolve_runtime_execution,
     train_one_epoch,
 )
 
@@ -65,13 +65,7 @@ except ImportError:  # pragma: no cover
     rasterio = None  # type: ignore[assignment]
     _RASTERIO_AVAILABLE = False
 
-_INTERIM_MONITORED_METRIC_NAME = MONITORED_METRIC_INTERIM_VAL_TOTAL_LOSS
 _BASELINE_COMPOSITE_METRIC_NAME = MONITORED_METRIC_COMPOSITE_BOUNDARY_EXTENT_F1
-_LEGACY_COMPOSITE_METRIC_ALIAS = MONITORED_METRIC_COMPOSITE_BOUNDARY_F1_EXTENT_F1
-_INTERIM_POLICY_NOTE = (
-    "Interim monitored metric is used until explicit boundary_F1/extent_F1 "
-    "run-metrics layer is implemented."
-)
 _REQUIRED_SPLIT_LAYER_DIRS = ("img", "extent", "boundary", "distance", "valid", "meta")
 _REQUIRED_RASTER_LAYERS = ("img", "extent", "boundary", "distance", "valid")
 _HISTORY_COLUMNS = [
@@ -89,6 +83,24 @@ _HISTORY_COLUMNS = [
     "train_n_valid",
     "val_n_valid",
     "n_aux",
+    "train_extent_f1",
+    "train_extent_precision",
+    "train_extent_recall",
+    "train_extent_iou",
+    "train_boundary_f1",
+    "train_boundary_precision",
+    "train_boundary_recall",
+    "train_boundary_skeleton_f1",
+    "train_boundary_buffer_f1",
+    "val_extent_f1",
+    "val_extent_precision",
+    "val_extent_recall",
+    "val_extent_iou",
+    "val_boundary_f1",
+    "val_boundary_precision",
+    "val_boundary_recall",
+    "val_boundary_skeleton_f1",
+    "val_boundary_buffer_f1",
 ]
 
 
@@ -107,12 +119,18 @@ class NetTrainRunResult:
     summary_path: Path
     config_used_path: Path
     history_path: Path
+    eval_val_path: Path
     epochs_completed: int
     best_metric_name: str
     best_metric_value: float
     best_epoch: int
     monitored_metric_mode: str
     monitored_metric_policy_note: str | None
+    device_requested: str | None
+    device_resolved: str
+    amp_requested: bool
+    amp_used: bool
+    oom_fallbacks_applied: tuple[str, ...]
     dataset_root: Path | None
     dataset_patch_size: int
 
@@ -522,18 +540,19 @@ def _extract_float(summary: dict[str, Any], key: str, *, context: str) -> float:
 
 
 def _resolve_metric_mode(metric_name: str, mode_override: str | None) -> tuple[str, str | None]:
+    if metric_name in DEPRECATED_MONITORED_METRIC_NAMES:
+        raise ContractError(
+            f"monitored_metric_name={metric_name!r} is deprecated and no longer supported. "
+            f"Use {_BASELINE_COMPOSITE_METRIC_NAME!r}."
+        )
     expected_mode = MONITORED_METRIC_EXPECTED_MODE.get(metric_name)
     if expected_mode is None:
         raise ContractError(
             f"Unsupported monitored_metric_name={metric_name!r}. "
             "Supported: "
-            f"{_BASELINE_COMPOSITE_METRIC_NAME!r}, "
-            f"{_INTERIM_MONITORED_METRIC_NAME!r}, "
-            f"{_LEGACY_COMPOSITE_METRIC_ALIAS!r}."
+            f"{_BASELINE_COMPOSITE_METRIC_NAME!r}."
         )
-    policy_note: str | None = (
-        _INTERIM_POLICY_NOTE if metric_name == _INTERIM_MONITORED_METRIC_NAME else None
-    )
+    policy_note: str | None = None
 
     if mode_override is None:
         return expected_mode, policy_note
@@ -548,9 +567,7 @@ def _resolve_metric_mode(metric_name: str, mode_override: str | None) -> tuple[s
 
 
 def _compute_monitored_metric(val_summary: dict[str, Any], metric_name: str) -> float:
-    if metric_name == _INTERIM_MONITORED_METRIC_NAME:
-        return _extract_float(val_summary, "total", context="val")
-    if metric_name in {_BASELINE_COMPOSITE_METRIC_NAME, _LEGACY_COMPOSITE_METRIC_ALIAS}:
+    if metric_name == _BASELINE_COMPOSITE_METRIC_NAME:
         boundary_f1 = _extract_float(val_summary, "boundary_f1", context="val")
         extent_f1 = _extract_float(val_summary, "extent_f1", context="val")
         return 0.6 * boundary_f1 + 0.4 * extent_f1
@@ -583,6 +600,32 @@ def _history_row(
         "val_boundary": _extract_float(val_summary, "boundary", context="val"),
         "val_distance": _extract_float(val_summary, "distance", context="val"),
         "val_total": _extract_float(val_summary, "total", context="val"),
+        "train_extent_f1": _extract_float(train_summary, "extent_f1", context="train"),
+        "train_extent_precision": _extract_float(train_summary, "extent_precision", context="train"),
+        "train_extent_recall": _extract_float(train_summary, "extent_recall", context="train"),
+        "train_extent_iou": _extract_float(train_summary, "extent_iou", context="train"),
+        "train_boundary_f1": _extract_float(train_summary, "boundary_f1", context="train"),
+        "train_boundary_precision": _extract_float(train_summary, "boundary_precision", context="train"),
+        "train_boundary_recall": _extract_float(train_summary, "boundary_recall", context="train"),
+        "train_boundary_skeleton_f1": _extract_float(
+            train_summary, "boundary_skeleton_f1", context="train"
+        ),
+        "train_boundary_buffer_f1": _extract_float(
+            train_summary, "boundary_buffer_f1", context="train"
+        ),
+        "val_extent_f1": _extract_float(val_summary, "extent_f1", context="val"),
+        "val_extent_precision": _extract_float(val_summary, "extent_precision", context="val"),
+        "val_extent_recall": _extract_float(val_summary, "extent_recall", context="val"),
+        "val_extent_iou": _extract_float(val_summary, "extent_iou", context="val"),
+        "val_boundary_f1": _extract_float(val_summary, "boundary_f1", context="val"),
+        "val_boundary_precision": _extract_float(val_summary, "boundary_precision", context="val"),
+        "val_boundary_recall": _extract_float(val_summary, "boundary_recall", context="val"),
+        "val_boundary_skeleton_f1": _extract_float(
+            val_summary, "boundary_skeleton_f1", context="val"
+        ),
+        "val_boundary_buffer_f1": _extract_float(
+            val_summary, "boundary_buffer_f1", context="val"
+        ),
         "monitored_metric": monitored_metric,
         "is_best": bool(is_best),
         "train_n_valid": int(train_summary.get("n_valid", 0)),
@@ -602,6 +645,23 @@ def _write_history_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerows(rows)
     except OSError as exc:
         raise ContractError(f"Failed to write history CSV at {path}: {exc}") from exc
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True, ensure_ascii=False)
+            fh.write("\n")
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"Failed to serialize JSON at {path}: {exc}") from exc
+    except OSError as exc:
+        raise ContractError(f"Failed to write JSON at {path}: {exc}") from exc
+
+
+def _is_out_of_memory_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or "cuda out of memory" in text
 
 
 def _load_checkpoint_state_dict(path: Path) -> dict[str, Any]:
@@ -762,8 +822,14 @@ def run_train_baseline(
     )
     scheduler_last_lr = float(optimizer.param_groups[0]["lr"])
 
-    resolved_device = device_override if device_override is not None else config.training.device
-    amp_enabled = bool(config.training.amp)
+    runtime_policy = resolve_runtime_execution(
+        requested_device=device_override if device_override is not None else config.training.device,
+        amp_requested=bool(config.training.amp),
+    )
+    resolved_device = str(runtime_policy["device_resolved"])
+    amp_requested = bool(runtime_policy["amp_requested"])
+    amp_used = bool(runtime_policy["amp_used"])
+    oom_fallbacks_applied: list[str] = []
 
     train_summary: dict[str, Any] = {}
     val_summary: dict[str, Any] = {}
@@ -779,29 +845,47 @@ def run_train_baseline(
         leave=True,
     ) as epoch_bar:
         for epoch in range(1, epochs + 1):
-            train_summary = train_one_epoch(
-                model,
-                train_loader,
-                loss_fn,
-                optimizer,
-                device=resolved_device,
-                amp_enabled=amp_enabled,
-                aux_weight=config.loss.aux_weight,
-                gradient_clip_norm=config.training.gradient_clip,
-                gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-                progress_enabled=progress_enabled,
-                input_normalizer=input_normalizer,
-            )
-            val_summary = evaluate_one_epoch(
-                model,
-                val_loader,
-                loss_fn,
-                device=resolved_device,
-                amp_enabled=amp_enabled,
-                aux_weight=config.loss.aux_weight,
-                progress_enabled=progress_enabled,
-                input_normalizer=input_normalizer,
-            )
+            while True:
+                try:
+                    train_summary = train_one_epoch(
+                        model,
+                        train_loader,
+                        loss_fn,
+                        optimizer,
+                        device=resolved_device,
+                        amp_enabled=amp_used,
+                        aux_weight=config.loss.aux_weight,
+                        gradient_clip_norm=config.training.gradient_clip,
+                        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+                        progress_enabled=progress_enabled,
+                        input_normalizer=input_normalizer,
+                    )
+                    val_summary = evaluate_one_epoch(
+                        model,
+                        val_loader,
+                        loss_fn,
+                        device=resolved_device,
+                        amp_enabled=amp_used,
+                        aux_weight=config.loss.aux_weight,
+                        progress_enabled=progress_enabled,
+                        input_normalizer=input_normalizer,
+                    )
+                    break
+                except RuntimeError as exc:
+                    if not _is_out_of_memory_error(exc):
+                        raise
+                    if amp_used:
+                        amp_used = False
+                        fallback_note = f"epoch_{epoch}:disable_amp_after_oom"
+                        oom_fallbacks_applied.append(fallback_note)
+                        if _TORCH_AVAILABLE and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    raise ContractError(
+                        "Out-of-memory during module_net_train epoch execution and no further "
+                        "runtime fallback is available. Baseline fallback policy can disable AMP once."
+                    ) from exc
 
             monitored_metric = _compute_monitored_metric(val_summary, resolved_metric_name)
             is_best = _is_improved(
@@ -861,6 +945,54 @@ def run_train_baseline(
 
     best_state_dict = _load_checkpoint_state_dict(best_checkpoint_path)
     model.load_state_dict(best_state_dict)
+    try:
+        eval_val_summary = evaluate_one_epoch(
+            model,
+            val_loader,
+            loss_fn,
+            device=resolved_device,
+            amp_enabled=amp_used,
+            aux_weight=config.loss.aux_weight,
+            progress_enabled=progress_enabled,
+            input_normalizer=input_normalizer,
+        )
+    except RuntimeError as exc:
+        if not _is_out_of_memory_error(exc):
+            raise
+        if not amp_used:
+            raise ContractError(
+                "Out-of-memory during eval_val generation and no further runtime fallback is available."
+            ) from exc
+        amp_used = False
+        oom_fallbacks_applied.append("eval_val:disable_amp_after_oom")
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        eval_val_summary = evaluate_one_epoch(
+            model,
+            val_loader,
+            loss_fn,
+            device=resolved_device,
+            amp_enabled=amp_used,
+            aux_weight=config.loss.aux_weight,
+            progress_enabled=progress_enabled,
+            input_normalizer=input_normalizer,
+        )
+    eval_val_path = run_path / "eval_val.json"
+    _write_json(
+        eval_val_path,
+        {
+            "schema_name": "net_train.eval_split",
+            "schema_version": "v1",
+            "run_id": run_id,
+            "split": "val",
+            "checkpoint_path": str(best_checkpoint_path),
+            "checkpoint_epoch": int(best_epoch),
+            "monitored_metric_name": resolved_metric_name,
+            "monitored_metric_mode": resolved_metric_mode,
+            "monitored_metric_value": _compute_monitored_metric(eval_val_summary, resolved_metric_name),
+            "metrics": dict(eval_val_summary),
+        },
+    )
 
     export_artifacts: NetTrainExportArtifacts = export_training_artifacts(
         run_dir=run_path,
@@ -883,10 +1015,17 @@ def run_train_baseline(
         history_path=history_path,
         train_summary=train_summary,
         val_summary=val_summary,
+        eval_val_summary=eval_val_summary,
+        eval_val_path=eval_val_path,
         monitored_metric_policy_note=policy_note,
         scheduler_state_dict=scheduler.state_dict(),
         scheduler_step_policy=scheduler_step_policy,
         scheduler_last_lr=scheduler_last_lr,
+        device_requested=runtime_policy["device_requested"],
+        device_resolved=str(runtime_policy["device_resolved"]),
+        amp_requested=amp_requested,
+        amp_used=amp_used,
+        oom_fallbacks_applied=tuple(oom_fallbacks_applied),
     )
 
     return NetTrainRunResult(
@@ -901,12 +1040,18 @@ def run_train_baseline(
         summary_path=export_artifacts.summary_path,
         config_used_path=export_artifacts.config_used_path,
         history_path=history_path,
+        eval_val_path=eval_val_path,
         epochs_completed=epochs,
         best_metric_name=resolved_metric_name,
         best_metric_value=best_metric_value,
         best_epoch=best_epoch,
         monitored_metric_mode=resolved_metric_mode,
         monitored_metric_policy_note=policy_note,
+        device_requested=runtime_policy["device_requested"],
+        device_resolved=str(runtime_policy["device_resolved"]),
+        amp_requested=amp_requested,
+        amp_used=amp_used,
+        oom_fallbacks_applied=tuple(oom_fallbacks_applied),
         dataset_root=resolved_dataset_root,
         dataset_patch_size=resolved_dataset_patch_size,
     )

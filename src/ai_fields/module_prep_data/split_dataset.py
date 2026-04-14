@@ -447,6 +447,12 @@ def run_split_dataset_stage(
     input_raster_path: str | None = None
     input_vector_path: str | None = None
     normalized_source_manifest_path: str | None = None
+    norm_stats_path: str | None = None
+    normalization_method: str | None = None
+    normalization_approximation: bool | None = None
+    normalization_rng_seed: int | None = None
+    normalization_exact_threshold_pixels: int | None = None
+    normalization_reservoir_capacity_per_band: int | None = None
 
     try:
         input_paths = prep_data_validators.validate_input_paths_contract(
@@ -501,12 +507,26 @@ def run_split_dataset_stage(
             }
             split_assignment_executed = compute_result["split_assignment_executed"]
             export_layout_materialized = compute_result["export_layout_materialized"]
+            norm_stats_path = compute_result.get("norm_stats_path")
+            normalization_method = compute_result.get("normalization_method")
+            normalization_approximation = compute_result.get("normalization_approximation")
+            normalization_rng_seed = compute_result.get("normalization_rng_seed")
+            normalization_exact_threshold_pixels = compute_result.get(
+                "normalization_exact_threshold_pixels"
+            )
+            normalization_reservoir_capacity_per_band = compute_result.get(
+                "normalization_reservoir_capacity_per_band"
+            )
     except ContractError as exc:
         status = "failed"
         error_type = type(exc).__name__
         error_message = str(exc)
         checks = _build_failure_checks(exc)
         blocking_issues = [str(exc)]
+
+    if status == "success":
+        checks["split_assignment_executed"] = split_assignment_executed
+        checks["export_layout_materialized"] = export_layout_materialized
 
     manifest_payload = {
         "schema_name": _MANIFEST_SCHEMA_NAME,
@@ -566,6 +586,13 @@ def run_split_dataset_stage(
                         float(resolved_config.normalization.scale_range[0]),
                         float(resolved_config.normalization.scale_range[1]),
                     ],
+                    "stats_method": normalization_method,
+                    "stats_approximation": normalization_approximation,
+                    "stats_rng_seed": normalization_rng_seed,
+                    "stats_exact_threshold_pixels": normalization_exact_threshold_pixels,
+                    "stats_reservoir_capacity_per_band": (
+                        normalization_reservoir_capacity_per_band
+                    ),
                 }
             ),
             "aoi_policy": (
@@ -610,6 +637,14 @@ def run_split_dataset_stage(
             }
         ),
         "split_assignment_executed": split_assignment_executed,
+        "norm_stats_path": norm_stats_path,
+        "normalization_stats": {
+            "method": normalization_method,
+            "approximation": normalization_approximation,
+            "rng_seed": normalization_rng_seed,
+            "exact_threshold_pixels": normalization_exact_threshold_pixels,
+            "reservoir_capacity_per_band": normalization_reservoir_capacity_per_band,
+        },
         "export_structure": {
             "required_dirs": required_dirs if required_dirs is not None else list(REQUIRED_SAMPLE_LAYERS),
             "materialized": export_layout_materialized,
@@ -641,6 +676,8 @@ def run_split_dataset_stage(
         "feature_channel_count": feature_channel_count,
         "split_assignment_executed": split_assignment_executed,
         "export_layout_materialized": export_layout_materialized,
+        "normalization_method": normalization_method,
+        "normalization_approximation": normalization_approximation,
         "split_metadata_consistent": checks["split_metadata_consistent"],
         "source_manifest_path": normalized_source_manifest_path,
         "blocking_issues": blocking_issues,

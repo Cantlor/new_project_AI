@@ -40,9 +40,40 @@ _FEATURE_MODE_TO_ASSEMBLED_VARIANT = {
     "raw8": "raw8_valid",
     "raw8_idx3": "raw8_idx3_valid",
 }
+_FEATURE_MODE_CHANNEL_SEMANTICS = {
+    "raw8": [
+        "coastal",
+        "blue",
+        "green",
+        "yellow",
+        "red",
+        "rededge",
+        "nir1",
+        "nir2",
+    ],
+    "raw8_idx3": [
+        "coastal",
+        "blue",
+        "green",
+        "yellow",
+        "red",
+        "rededge",
+        "nir1",
+        "nir2",
+        "ndvi",
+        "savi",
+        "ndwi",
+    ],
+}
 _SPATIAL_CONTEXT_SCHEMA_NAME = "prep_data.aoi_manifest"
 _SPATIAL_MODE_FULL_RASTER = "full_raster"
 _SPATIAL_MODE_AOI_LIMITED = "aoi_limited"
+_MATERIALIZATION_COMPUTE_SPEC_ONLY = "compute_spec_only"
+_MATERIALIZATION_FULL_SCENE = "full_scene"
+_ALLOWED_MATERIALIZATION_MODES = {
+    _MATERIALIZATION_COMPUTE_SPEC_ONLY,
+    _MATERIALIZATION_FULL_SCENE,
+}
 
 
 @dataclass(frozen=True)
@@ -338,13 +369,16 @@ def _resolve_feature_contract(
                     f"got {len(channel_semantics)}."
                 )
 
+    if channel_semantics is None:
+        channel_semantics = list(_FEATURE_MODE_CHANNEL_SEMANTICS[mode])
+
     return {
         "feature_mode": mode,
         "feature_channel_count": feature_channel_count,
         "derived_indices": derived_indices,
         "assembled_model_input_variants": assembled_variants,
         "channel_semantics": channel_semantics,
-        "channel_semantics_resolved": True if channel_semantics is not None else None,
+        "channel_semantics_resolved": True,
         "feature_metadata_checked": feature_metadata_checked,
         "valid_saved_separately": True,
         "normalization_plan": {
@@ -421,6 +455,7 @@ def run_prepare_features_stage(
     source_manifest_path: str | Path | None = None,
     module_version: str | None = None,
     runtime_compute_enabled: bool = True,
+    materialization_mode: str = _MATERIALIZATION_COMPUTE_SPEC_ONLY,
 ) -> PrepareFeaturesStageResult:
     """Run lightweight `03_prepare_features` stage and write manifest/summary.
 
@@ -458,6 +493,7 @@ def run_prepare_features_stage(
     img_output_path: str | None = None
     valid_output_path: str | None = None
     features_compute_mode: str | None = None
+    resolved_materialization_mode = _MATERIALIZATION_COMPUTE_SPEC_ONLY
     spatial_context_mode: str = _SPATIAL_MODE_FULL_RASTER
     spatial_context_bounds_used: list[float] | None = None
     spatial_context_bounds_source: str | None = None
@@ -466,6 +502,16 @@ def run_prepare_features_stage(
     try:
         input_raster_path = _normalize_optional_path("raster_path", raster_path)
         input_valid_path = _normalize_optional_path("valid_path", valid_path)
+        if materialization_mode not in _ALLOWED_MATERIALIZATION_MODES:
+            raise ContractError(
+                "materialization_mode for stage 03 must be one of "
+                f"{sorted(_ALLOWED_MATERIALIZATION_MODES)}, got {materialization_mode!r}."
+            )
+        if materialization_mode == _MATERIALIZATION_FULL_SCENE and not runtime_compute_enabled:
+            raise ContractError(
+                "materialization_mode='full_scene' requires runtime_compute_enabled=True."
+            )
+        resolved_materialization_mode = materialization_mode
         if source_manifest_path is not None:
             normalized_source_manifest_path = str(
                 _normalize_path("source_manifest_path", source_manifest_path)
@@ -497,7 +543,7 @@ def run_prepare_features_stage(
         feature_metadata_checked = resolved["feature_metadata_checked"]
         normalization_plan = resolved["normalization_plan"]
 
-        if runtime_compute_enabled:
+        if runtime_compute_enabled and resolved_materialization_mode == _MATERIALIZATION_FULL_SCENE:
             if features_compute is None:
                 raise ContractError(
                     "runtime_compute_enabled=True but features_compute module "
@@ -564,6 +610,7 @@ def run_prepare_features_stage(
             "spatial_context_mode": spatial_context_mode,
             "spatial_context_manifest_consumed": spatial_context_manifest_consumed,
             "spatial_context_bounds_source": spatial_context_bounds_source,
+            "materialization_mode": resolved_materialization_mode,
         },
         "provenance": {
             "source_run_ids": [],
@@ -586,11 +633,28 @@ def run_prepare_features_stage(
             "features": {
                 "feature_mode": feature_mode,
                 "feature_channel_count": feature_channel_count,
+                "channel_semantics": channel_semantics if channel_semantics is not None else [],
                 "derived_indices": derived_indices,
+                "assembled_model_input_variant": (
+                    assembled_variants[0] if assembled_variants else None
+                ),
                 "assembled_model_input_variants": assembled_variants,
                 "valid_saved_separately": valid_saved_separately,
                 "channel_semantics_resolved": channel_semantics_resolved,
                 "feature_metadata_checked": feature_metadata_checked,
+                "feature_compute_spec": {
+                    "feature_mode": feature_mode,
+                    "feature_channel_count": feature_channel_count,
+                    "channel_semantics": (
+                        channel_semantics if channel_semantics is not None else []
+                    ),
+                    "derived_indices": derived_indices if derived_indices is not None else [],
+                    "assembled_model_input_variant": (
+                        assembled_variants[0] if assembled_variants else None
+                    ),
+                },
+                "window_processing_enabled": True,
+                "materialization_mode": resolved_materialization_mode,
             },
             "valid_policy": {},
             "normalization": normalization_plan,
@@ -608,6 +672,7 @@ def run_prepare_features_stage(
         "input_valid_path": input_valid_path,
         "img_output_path": img_output_path,
         "valid_output_path": valid_output_path,
+        "materialization_mode": resolved_materialization_mode,
         "feature_mode": feature_mode,
         "feature_channel_count": feature_channel_count,
         "channel_semantics": channel_semantics if channel_semantics is not None else [],
@@ -617,6 +682,19 @@ def run_prepare_features_stage(
         "derived_indices": derived_indices if derived_indices is not None else [],
         "valid_saved_separately": valid_saved_separately,
         "assembled_model_input_variants": assembled_variants if assembled_variants is not None else [],
+        "assembled_model_input_variant": (
+            assembled_variants[0] if assembled_variants else None
+        ),
+        "feature_compute_spec": {
+            "feature_mode": feature_mode,
+            "feature_channel_count": feature_channel_count,
+            "channel_semantics": channel_semantics if channel_semantics is not None else [],
+            "derived_indices": derived_indices if derived_indices is not None else [],
+            "assembled_model_input_variant": (
+                assembled_variants[0] if assembled_variants else None
+            ),
+        },
+        "window_processing_enabled": True,
         "normalization_plan": normalization_plan,
         "spatial_context_mode": spatial_context_mode,
         "effective_extent_bounds_used": spatial_context_bounds_used,

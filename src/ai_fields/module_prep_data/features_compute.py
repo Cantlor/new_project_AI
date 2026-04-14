@@ -187,6 +187,34 @@ def build_feature_stack(ds: Any, feature_mode: str, *, window: Any | None = None
     except Exception as exc:
         raise ContractError(f"Failed to read raster bands: {exc}") from exc
 
+    return build_feature_stack_from_array(raw, feature_mode)
+
+
+def build_feature_stack_from_array(raw: np.ndarray, feature_mode: str) -> np.ndarray:
+    """Build (C, H, W) float32 feature array from an already-read raw8 array.
+
+    This helper is the canonical no-extra-I/O path for patch-first runtime:
+    caller reads a halo window once, then computes features from that in-memory
+    array instead of reading the same window again through a DatasetReader.
+    """
+    if feature_mode not in ("raw8", "raw8_idx3"):
+        raise ContractError(
+            f"Unsupported feature_mode '{feature_mode}'. "
+            "Supported: 'raw8', 'raw8_idx3'."
+        )
+
+    if raw.ndim != 3:
+        raise ContractError(
+            f"raw feature source must be a 3D array (C,H,W), got shape={raw.shape}."
+        )
+    if raw.shape[0] != _REQUIRED_BAND_COUNT:
+        raise ContractError(
+            "raw feature source must contain exactly 8 channels, got "
+            f"{raw.shape[0]}."
+        )
+
+    raw = raw.astype(np.float32, copy=False)
+
     if feature_mode == "raw8":
         return raw
 

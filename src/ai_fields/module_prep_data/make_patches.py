@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from ai_fields.common.constants import DATA_CONTRACT_VERSION, REQUIRED_SAMPLE_LAYERS
 from ai_fields.common.errors import ContractError
-from ai_fields.common.manifests import write_manifest, write_summary
+from ai_fields.common.manifests import read_manifest, write_manifest, write_summary
 from ai_fields.module_prep_data import config as prep_data_config
 from ai_fields.module_prep_data import validators as prep_data_validators
 from ai_fields.module_prep_data.schemas import PrepDataConfig
@@ -35,6 +35,9 @@ _MANIFEST_FILENAME = "patches_manifest.json"
 _SUMMARY_FILENAME = "summary.json"
 _INPUT_REFS_SOURCE = "stage_args_transitional"
 _PATCH_CONTRACT_MODE = "metadata_snapshot_only"
+_SPATIAL_CONTEXT_SCHEMA_NAME = "prep_data.aoi_manifest"
+_PATCH_RUNTIME_MODE_PATCH_FIRST = "patch_first_from_source"
+_PATCH_RUNTIME_MODE_FULL_SCENE = "legacy_full_scene_diagnostic"
 
 _ERROR_CODE_ATTR = "stage_error_code"
 _ERR_PATCH_METADATA_TYPE = "patch_metadata_type_invalid"
@@ -137,6 +140,63 @@ def _normalize_optional_path(name: str, value: Any | None) -> str | None:
 def _now_utc_iso() -> str:
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     return ts.replace("+00:00", "Z")
+
+
+def _extract_stage02_runtime_context(
+    source_manifest_path: str | None,
+) -> dict[str, Any] | None:
+    if source_manifest_path is None:
+        return None
+    manifest = read_manifest(source_manifest_path)
+    if manifest.get("schema_name") != _SPATIAL_CONTEXT_SCHEMA_NAME:
+        return None
+
+    spatial = manifest.get("resolved_contract", {}).get("spatial", {})
+    source_kind = manifest.get("source_kind", spatial.get("source_kind"))
+    source_path = manifest.get("source_path", spatial.get("source_path"))
+    vector_runtime_path = manifest.get(
+        "vector_runtime_path", spatial.get("vector_runtime_path")
+    )
+    spatial_context_mode = manifest.get(
+        "spatial_context_mode", spatial.get("spatial_context_mode", "full_raster")
+    )
+    effective_extent_bounds = manifest.get(
+        "effective_extent_bounds", spatial.get("effective_extent_bounds")
+    )
+
+    if not isinstance(source_path, str) or source_path.strip() == "":
+        raise ContractError(
+            "Stage-02 manifest does not provide canonical source_path for patch-first stage 05."
+        )
+    if not isinstance(vector_runtime_path, str) or vector_runtime_path.strip() == "":
+        raise ContractError(
+            "Stage-02 manifest does not provide vector_runtime_path for patch-first stage 05."
+        )
+    if source_kind not in {"direct_raster", "vrt", "block_cache"}:
+        raise ContractError(
+            "Stage-02 manifest has invalid source_kind for patch-first stage 05: "
+            f"{source_kind!r}."
+        )
+    if spatial_context_mode not in {"full_raster", "aoi_limited"}:
+        raise ContractError(
+            "Stage-02 manifest has invalid spatial_context_mode for patch-first stage 05: "
+            f"{spatial_context_mode!r}."
+        )
+
+    return {
+        "source_kind": source_kind,
+        "source_path": source_path,
+        "vector_runtime_path": vector_runtime_path,
+        "spatial_context_mode": spatial_context_mode,
+        "effective_extent_bounds": effective_extent_bounds,
+        "memory_budget_mb": manifest.get("memory_budget_mb", spatial.get("memory_budget_mb")),
+        "large_scene_mode": manifest.get("large_scene_mode", spatial.get("large_scene_mode")),
+        "auto_mode_reason": manifest.get("auto_mode_reason", spatial.get("auto_mode_reason")),
+        "full_scene_materialization_allowed": manifest.get(
+            "full_scene_materialization_allowed",
+            spatial.get("full_scene_materialization_allowed"),
+        ),
+    }
 
 
 def _resolve_config(
@@ -421,6 +481,7 @@ def run_make_patches_stage(
     valid_path: Any | None = None,
     patch_metadata: Any | None = None,
     source_manifest_path: str | Path | None = None,
+    spatial_manifest_path: str | Path | None = None,
     module_version: str | None = None,
     runtime_compute_enabled: bool = True,
 ) -> MakePatchesStageResult:
@@ -467,6 +528,22 @@ def run_make_patches_stage(
     input_distance_path: str | None = None
     input_valid_path: str | None = None
     normalized_source_manifest_path: str | None = None
+    normalized_spatial_manifest_path: str | None = None
+    stage02_runtime_context: dict[str, Any] | None = None
+    patch_runtime_mode = _PATCH_CONTRACT_MODE
+    canonical_source_path: str | None = None
+    canonical_source_kind: str | None = None
+    vector_runtime_path: str | None = None
+    spatial_context_mode: str | None = None
+    effective_extent_bounds_used: list[float] | None = None
+    memory_budget_mb: int | None = None
+    large_scene_mode: bool | None = None
+    auto_mode_reason: str | None = None
+    full_scene_materialization_allowed: bool | None = None
+    vector_load_policy: dict[str, Any] | None = None
+    block_aware_reading: dict[str, Any] | None = None
+    double_read_avoided: bool | None = None
+    candidate_windows_total: int | None = None
 
     try:
         input_paths = prep_data_validators.validate_input_paths_contract(
@@ -484,6 +561,10 @@ def run_make_patches_stage(
         if source_manifest_path is not None:
             normalized_source_manifest_path = str(
                 _normalize_path("source_manifest_path", source_manifest_path)
+            )
+        if spatial_manifest_path is not None:
+            normalized_spatial_manifest_path = str(
+                _normalize_path("spatial_manifest_path", spatial_manifest_path)
             )
 
         resolved_config, config_used_path = _resolve_config(config=config, config_path=config_path)
@@ -509,11 +590,75 @@ def run_make_patches_stage(
         patch_artifacts_materialized = resolved["patch_artifacts_materialized"]
         patch_metadata_checked = resolved["patch_metadata_checked"]
 
+        if runtime_compute_enabled:
+            stage02_manifest_for_patch_first = normalized_spatial_manifest_path
+            if (
+                stage02_manifest_for_patch_first is None
+                and normalized_source_manifest_path is not None
+            ):
+                maybe_ctx = _extract_stage02_runtime_context(normalized_source_manifest_path)
+                if maybe_ctx is not None:
+                    stage02_manifest_for_patch_first = normalized_source_manifest_path
+                    stage02_runtime_context = maybe_ctx
+            if stage02_manifest_for_patch_first is not None and stage02_runtime_context is None:
+                stage02_runtime_context = _extract_stage02_runtime_context(
+                    stage02_manifest_for_patch_first
+                )
+            if normalized_spatial_manifest_path is not None and stage02_runtime_context is None:
+                raise ContractError(
+                    "spatial_manifest_path must reference a valid stage-02 aoi_manifest."
+                )
+
         _all_layer_paths_provided = all(
             p is not None
             for p in [img_path, extent_path, boundary_path, distance_path, valid_path]
         )
-        if runtime_compute_enabled and _all_layer_paths_provided:
+        if runtime_compute_enabled and stage02_runtime_context is not None:
+            if patches_compute is None:
+                raise ContractError(
+                    "runtime_compute_enabled=True but patches_compute module "
+                    "could not be imported (rasterio/numpy missing?)."
+                )
+            canonical_source_path = stage02_runtime_context["source_path"]
+            canonical_source_kind = stage02_runtime_context["source_kind"]
+            vector_runtime_path = stage02_runtime_context["vector_runtime_path"]
+            spatial_context_mode = stage02_runtime_context["spatial_context_mode"]
+            if isinstance(stage02_runtime_context.get("effective_extent_bounds"), list):
+                effective_extent_bounds_used = [
+                    float(v) for v in stage02_runtime_context["effective_extent_bounds"]
+                ]
+            else:
+                effective_extent_bounds_used = None
+            memory_budget_mb = stage02_runtime_context.get("memory_budget_mb")
+            large_scene_mode = stage02_runtime_context.get("large_scene_mode")
+            auto_mode_reason = stage02_runtime_context.get("auto_mode_reason")
+            full_scene_materialization_allowed = stage02_runtime_context.get(
+                "full_scene_materialization_allowed"
+            )
+
+            compute_result = patches_compute.compute_and_save_patches_from_source(
+                raster_source_path=canonical_source_path,
+                vector_runtime_path=vector_runtime_path,
+                output_dir=output_root,
+                config=resolved_config,
+                feature_mode=resolved_config.feature_mode,
+                source_kind=canonical_source_kind,
+                spatial_context_mode=spatial_context_mode,
+                effective_extent_bounds=effective_extent_bounds_used,
+            )
+            written_total = compute_result["written_total"]
+            written_center = compute_result["written_center"]
+            written_boundary = compute_result["written_boundary"]
+            written_negative = compute_result["written_negative"]
+            rejection_stats = compute_result["rejection_stats"]
+            vector_load_policy = compute_result.get("vector_load_policy")
+            block_aware_reading = compute_result.get("block_aware_reading")
+            double_read_avoided = compute_result.get("double_read_avoided")
+            candidate_windows_total = compute_result.get("candidate_windows_total")
+            patch_runtime_executed = True
+            patch_artifacts_materialized = True
+            patch_runtime_mode = _PATCH_RUNTIME_MODE_PATCH_FIRST
+        elif runtime_compute_enabled and _all_layer_paths_provided:
             if patches_compute is None:
                 raise ContractError(
                     "runtime_compute_enabled=True but patches_compute module "
@@ -536,12 +681,28 @@ def run_make_patches_stage(
             rejection_stats = compute_result["rejection_stats"]
             patch_runtime_executed = True
             patch_artifacts_materialized = True
+            patch_runtime_mode = _PATCH_RUNTIME_MODE_FULL_SCENE
+        elif runtime_compute_enabled:
+            any_layer_path_provided = any(
+                p is not None
+                for p in [img_path, extent_path, boundary_path, distance_path, valid_path]
+            )
+            if any_layer_path_provided and not _all_layer_paths_provided:
+                raise ContractError(
+                    "Stage 05 diagnostic full-scene mode requires all layer paths: "
+                    "img_path, extent_path, boundary_path, distance_path, valid_path."
+                )
+            # Metadata-only snapshot mode is still supported for unit-level
+            # contract checks when no runtime inputs are provided.
     except ContractError as exc:
         status = "failed"
         error_type = type(exc).__name__
         error_message = str(exc)
         checks = _build_failure_checks(exc)
         blocking_issues = [str(exc)]
+
+    if status == "success":
+        checks["patch_runtime_executed"] = patch_runtime_executed
 
     manifest_payload = {
         "schema_name": _MANIFEST_SCHEMA_NAME,
@@ -561,12 +722,25 @@ def run_make_patches_stage(
             "feature_mode": None if resolved_config is None else resolved_config.feature_mode,
             "patch_size": patch_size,
             "sampling_policy": sampling_policy,
+            "halo_px": None if resolved_config is None else int(resolved_config.patches.halo_px),
+            "distance_clip_px": (
+                None if resolved_config is None else int(resolved_config.distance.distance_clip_px)
+            ),
         },
         "provenance": {
             "source_run_ids": [],
-            "source_manifest_paths": (
-                [] if normalized_source_manifest_path is None else [normalized_source_manifest_path]
-            ),
+            "source_manifest_paths": [
+                *(
+                    [normalized_source_manifest_path]
+                    if normalized_source_manifest_path is not None
+                    else []
+                ),
+                *(
+                    [normalized_spatial_manifest_path]
+                    if normalized_spatial_manifest_path is not None
+                    else []
+                ),
+            ],
             "source_config_paths": [],
             "code_version": None,
             "git_commit": None,
@@ -574,7 +748,17 @@ def run_make_patches_stage(
         "inputs": {"artifacts": []},
         "outputs": {"artifacts": []},
         "resolved_contract": {
-            "spatial": {},
+            "spatial": {
+                "source_kind": canonical_source_kind,
+                "source_path": canonical_source_path,
+                "vector_runtime_path": vector_runtime_path,
+                "spatial_context_mode": spatial_context_mode,
+                "effective_extent_bounds_used": effective_extent_bounds_used,
+                "memory_budget_mb": memory_budget_mb,
+                "large_scene_mode": large_scene_mode,
+                "auto_mode_reason": auto_mode_reason,
+                "full_scene_materialization_allowed": full_scene_materialization_allowed,
+            },
             "features": {
                 "feature_mode": None if resolved_config is None else resolved_config.feature_mode,
             },
@@ -625,11 +809,15 @@ def run_make_patches_stage(
         "input_boundary_path": input_boundary_path,
         "input_distance_path": input_distance_path,
         "input_valid_path": input_valid_path,
-        "patch_contract_mode": (
-            "runtime_compute" if patch_artifacts_materialized else _PATCH_CONTRACT_MODE
-        ),
+        "spatial_manifest_path": normalized_spatial_manifest_path,
+        "patch_contract_mode": patch_runtime_mode if patch_artifacts_materialized else _PATCH_CONTRACT_MODE,
+        "patch_runtime_mode": patch_runtime_mode,
         "runtime_compute_enabled": runtime_compute_enabled,
         "patch_size": patch_size,
+        "halo_px": None if resolved_config is None else int(resolved_config.patches.halo_px),
+        "distance_clip_px": (
+            None if resolved_config is None else int(resolved_config.distance.distance_clip_px)
+        ),
         "sampling_policy": sampling_policy,
         "patch_layers": patch_layers if patch_layers is not None else [],
         "written_total": written_total,
@@ -641,6 +829,19 @@ def run_make_patches_stage(
         "patch_exports": patch_exports if patch_exports is not None else {},
         "patch_runtime_executed": patch_runtime_executed,
         "patch_artifacts_materialized": patch_artifacts_materialized,
+        "canonical_source_path": canonical_source_path,
+        "canonical_source_kind": canonical_source_kind,
+        "vector_runtime_path": vector_runtime_path,
+        "spatial_context_mode": spatial_context_mode,
+        "effective_extent_bounds_used": effective_extent_bounds_used,
+        "memory_budget_mb": memory_budget_mb,
+        "large_scene_mode": large_scene_mode,
+        "auto_mode_reason": auto_mode_reason,
+        "full_scene_materialization_allowed": full_scene_materialization_allowed,
+        "vector_load_policy": vector_load_policy,
+        "block_aware_reading": block_aware_reading,
+        "double_read_avoided": double_read_avoided,
+        "candidate_windows_total": candidate_windows_total,
         "patch_metadata_checked": patch_metadata_checked,
         "checks": checks,
         "diagnostics": {
@@ -657,9 +858,8 @@ def run_make_patches_stage(
         "status": status,
         "input_refs_source": _INPUT_REFS_SOURCE,
         "contract_checks_passed": status == "success",
-        "patch_contract_mode": (
-            "runtime_compute" if patch_artifacts_materialized else _PATCH_CONTRACT_MODE
-        ),
+        "patch_contract_mode": patch_runtime_mode if patch_artifacts_materialized else _PATCH_CONTRACT_MODE,
+        "patch_runtime_mode": patch_runtime_mode,
         "patch_size": patch_size,
         "sampling_policy": sampling_policy,
         "written_total": written_total,

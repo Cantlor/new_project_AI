@@ -27,15 +27,20 @@ from ai_fields.common.errors import (
     ValidPolicyError,
 )
 
-# Canonical monitored metric policy names for module_net_train baseline.
-MONITORED_METRIC_INTERIM_VAL_TOTAL_LOSS = "interim_val_total_loss"
+# Canonical monitored metric policy name for module_net_train baseline.
 MONITORED_METRIC_COMPOSITE_BOUNDARY_EXTENT_F1 = "composite_boundary_extent_f1"
+
+# Deprecated names are kept only to emit explicit migration errors.
+MONITORED_METRIC_INTERIM_VAL_TOTAL_LOSS = "interim_val_total_loss"
 MONITORED_METRIC_COMPOSITE_BOUNDARY_F1_EXTENT_F1 = "composite_boundary_f1_extent_f1"
 
+DEPRECATED_MONITORED_METRIC_NAMES = {
+    MONITORED_METRIC_INTERIM_VAL_TOTAL_LOSS,
+    MONITORED_METRIC_COMPOSITE_BOUNDARY_F1_EXTENT_F1,
+}
+
 MONITORED_METRIC_EXPECTED_MODE: dict[str, str] = {
-    MONITORED_METRIC_INTERIM_VAL_TOTAL_LOSS: "min",
     MONITORED_METRIC_COMPOSITE_BOUNDARY_EXTENT_F1: "max",
-    MONITORED_METRIC_COMPOSITE_BOUNDARY_F1_EXTENT_F1: "max",
 }
 
 
@@ -331,6 +336,11 @@ class MonitoringConfig:
     def validate(self) -> None:
         if not isinstance(self.monitored_metric_name, str) or self.monitored_metric_name.strip() == "":
             raise ContractError("monitoring.monitored_metric_name must be a non-empty string.")
+        if self.monitored_metric_name in DEPRECATED_MONITORED_METRIC_NAMES:
+            raise ContractError(
+                f"monitoring.monitored_metric_name '{self.monitored_metric_name}' is deprecated "
+                f"and no longer supported. Use '{MONITORED_METRIC_COMPOSITE_BOUNDARY_EXTENT_F1}'."
+            )
         expected_mode = MONITORED_METRIC_EXPECTED_MODE.get(self.monitored_metric_name)
         if expected_mode is None:
             raise ContractError(

@@ -83,14 +83,7 @@ def rasterize_extent(ds: Any, vector_gdf: Any) -> np.ndarray:
 
     Values: 0=background, 1=foreground field, 255=ignore (near NoData border).
     """
-    try:
-        import rasterio.features  # noqa: PLC0415
-        from shapely.geometry import mapping  # noqa: PLC0415
-    except ImportError as exc:  # pragma: no cover
-        raise ContractError("rasterio.features and shapely are required") from exc
-
     h, w = ds.height, ds.width
-    transform = ds.transform
 
     # Reproject vector to raster CRS
     raster_crs = ds.crs
@@ -103,24 +96,13 @@ def rasterize_extent(ds: Any, vector_gdf: Any) -> np.ndarray:
                 f"Failed to reproject vector to raster CRS: {exc}"
             ) from exc
 
-    shapes = [(mapping(geom), 1) for geom in vector_gdf.geometry if geom is not None and not geom.is_empty]
-
-    if not shapes:
-        return np.zeros((h, w), dtype=np.uint8)
-
-    try:
-        extent = rasterio.features.rasterize(
-            shapes,
-            out_shape=(h, w),
-            transform=transform,
-            fill=0,
-            dtype=np.uint8,
-            all_touched=False,
-        )
-    except Exception as exc:
-        raise ContractError(f"Failed to rasterize extent: {exc}") from exc
-
-    return extent.astype(np.uint8)
+    geoms = [geom for geom in vector_gdf.geometry if geom is not None and not geom.is_empty]
+    return rasterize_extent_for_window(
+        transform=ds.transform,
+        height=h,
+        width=w,
+        vector_geometries=geoms,
+    )
 
 
 def build_boundary_target(
@@ -133,15 +115,7 @@ def build_boundary_target(
     boundary_raw: raw rasterized polygon edge pixels (0/1).
     boundary:     boundary_raw + dilation buffer zone encoded as 2.
     """
-    try:
-        import rasterio.features  # noqa: PLC0415
-        from scipy.ndimage import binary_dilation  # noqa: PLC0415
-        from shapely.geometry import mapping  # noqa: PLC0415
-    except ImportError as exc:  # pragma: no cover
-        raise ContractError("rasterio.features, scipy, and shapely are required") from exc
-
     h, w = ds.height, ds.width
-    transform = ds.transform
     raster_crs = ds.crs
 
     if raster_crs is not None and vector_gdf.crs is not None:
@@ -153,47 +127,14 @@ def build_boundary_target(
                 f"Failed to reproject vector for boundary: {exc}"
             ) from exc
 
-    # Extract polygon boundary lines (linework-faithful)
-    boundary_geoms = []
-    for geom in vector_gdf.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        try:
-            bnd = geom.boundary
-            if bnd is not None and not bnd.is_empty:
-                boundary_geoms.append((mapping(bnd), 1))
-        except Exception:
-            continue
-
-    if not boundary_geoms:
-        empty = np.zeros((h, w), dtype=np.uint8)
-        return empty, empty
-
-    try:
-        boundary_raw = rasterio.features.rasterize(
-            boundary_geoms,
-            out_shape=(h, w),
-            transform=transform,
-            fill=0,
-            dtype=np.uint8,
-            all_touched=True,
-        )
-    except Exception as exc:
-        raise ContractError(f"Failed to rasterize boundary: {exc}") from exc
-
-    # Buffer zone: dilate skeleton by 3 iterations, mark buffer pixels as 2
-    try:
-        dilated = binary_dilation(boundary_raw.astype(bool), iterations=3)
-        buffer_zone = (dilated & ~boundary_raw.astype(bool)).astype(np.uint8)
-    except Exception as exc:
-        raise ContractError(f"Failed to compute boundary buffer: {exc}") from exc
-
-    # Encode: 0=bg, 1=skeleton, 2=buffer
-    boundary = np.zeros((h, w), dtype=np.uint8)
-    boundary[buffer_zone == 1] = 2
-    boundary[boundary_raw == 1] = 1  # skeleton overwrites buffer where they overlap
-
-    return boundary, boundary_raw.astype(np.uint8)
+    geoms = [geom for geom in vector_gdf.geometry if geom is not None and not geom.is_empty]
+    return build_boundary_target_for_window(
+        transform=ds.transform,
+        height=h,
+        width=w,
+        vector_geometries=geoms,
+        buffer_iterations=3,
+    )
 
 
 def compute_distance_target(
@@ -216,6 +157,118 @@ def compute_distance_target(
 
     # Zero out invalid pixels
     dist[valid_mask == 0] = 0.0
+    return dist
+
+
+def rasterize_extent_for_window(
+    *,
+    transform: Any,
+    height: int,
+    width: int,
+    vector_geometries: list[Any],
+) -> np.ndarray:
+    """Rasterize extent for a window/grid definition.
+
+    Returns uint8 (H, W), values:
+      - 0 background
+      - 1 foreground
+    """
+    try:
+        import rasterio.features  # noqa: PLC0415
+        from shapely.geometry import mapping  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover
+        raise ContractError("rasterio.features and shapely are required") from exc
+
+    shapes = [(mapping(geom), 1) for geom in vector_geometries if geom is not None and not geom.is_empty]
+    if not shapes:
+        return np.zeros((height, width), dtype=np.uint8)
+
+    try:
+        extent = rasterio.features.rasterize(
+            shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=False,
+        )
+    except Exception as exc:
+        raise ContractError(f"Failed to rasterize extent for window: {exc}") from exc
+    return extent.astype(np.uint8)
+
+
+def build_boundary_target_for_window(
+    *,
+    transform: Any,
+    height: int,
+    width: int,
+    vector_geometries: list[Any],
+    buffer_iterations: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build boundary + boundary_raw for a specific window/grid."""
+    try:
+        import rasterio.features  # noqa: PLC0415
+        from scipy.ndimage import binary_dilation  # noqa: PLC0415
+        from shapely.geometry import mapping  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover
+        raise ContractError("rasterio.features, scipy, and shapely are required") from exc
+
+    boundary_geoms = []
+    for geom in vector_geometries:
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            bnd = geom.boundary
+            if bnd is not None and not bnd.is_empty:
+                boundary_geoms.append((mapping(bnd), 1))
+        except Exception:
+            continue
+
+    if not boundary_geoms:
+        empty = np.zeros((height, width), dtype=np.uint8)
+        return empty, empty
+
+    try:
+        boundary_raw = rasterio.features.rasterize(
+            boundary_geoms,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=True,
+        )
+    except Exception as exc:
+        raise ContractError(f"Failed to rasterize boundary for window: {exc}") from exc
+
+    try:
+        dilated = binary_dilation(boundary_raw.astype(bool), iterations=buffer_iterations)
+        buffer_zone = (dilated & ~boundary_raw.astype(bool)).astype(np.uint8)
+    except Exception as exc:
+        raise ContractError(f"Failed to compute boundary buffer for window: {exc}") from exc
+
+    boundary = np.zeros((height, width), dtype=np.uint8)
+    boundary[buffer_zone == 1] = 2
+    boundary[boundary_raw == 1] = 1
+    return boundary, boundary_raw.astype(np.uint8)
+
+
+def compute_distance_target_clipped(
+    boundary_raw: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    distance_clip_px: int,
+) -> np.ndarray:
+    """Compute unsigned distance target and clip to the configured max distance."""
+    if isinstance(distance_clip_px, bool) or not isinstance(distance_clip_px, int):
+        raise ContractError(
+            "distance_clip_px must be an integer, "
+            f"got {type(distance_clip_px).__name__}."
+        )
+    if distance_clip_px <= 0:
+        raise ContractError(f"distance_clip_px must be > 0, got {distance_clip_px}.")
+
+    dist = compute_distance_target(boundary_raw=boundary_raw, valid_mask=valid_mask)
+    np.minimum(dist, float(distance_clip_px), out=dist)
     return dist
 
 
@@ -253,6 +306,7 @@ def compute_and_save_targets(
     vector_path: Any,
     output_dir: Any,
     valid_path: Any | None = None,
+    distance_clip_px: int | None = None,
 ) -> dict:
     """Compute and write target rasters aligned to the source raster grid.
 
@@ -303,12 +357,20 @@ def compute_and_save_targets(
 
             # Compute extent
             extent = rasterize_extent(ds, vec_gdf)
+            extent[valid_mask == 0] = _IGNORE_LABEL
 
             # Compute boundary targets
             boundary, boundary_raw = build_boundary_target(ds, vec_gdf)
 
             # Compute distance target
-            distance = compute_distance_target(boundary_raw, valid_mask)
+            if distance_clip_px is None:
+                distance = compute_distance_target(boundary_raw, valid_mask)
+            else:
+                distance = compute_distance_target_clipped(
+                    boundary_raw=boundary_raw,
+                    valid_mask=valid_mask,
+                    distance_clip_px=int(distance_clip_px),
+                )
     except ContractError:
         raise
     except Exception as exc:

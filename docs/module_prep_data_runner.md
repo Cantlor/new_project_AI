@@ -83,4 +83,13 @@ bash tools/run_module_prep_data.sh \
 
 ## Примечание по текущему коду
 
-В `run_pipeline` по умолчанию `--runtime-compute-enabled` выключен, поэтому без явного включения стадии 02..07 работают как metadata/contract-driven и не материализуют полный train-ready export.
+В `run_pipeline` по умолчанию `--runtime-compute-enabled` включен.  
+Baseline path:
+- Stage 03/04 работают как `compute_spec_only` (без обязательной full-scene materialization);
+- Stage 05 материализует train-ready samples в patch-first режиме из Stage 02 canonical source.
+
+Для diagnostic full-scene Stage 03/04 используйте:
+
+```bash
+--diagnostic-full-scene-materialization
+```

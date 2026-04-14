@@ -19,6 +19,10 @@ SPLIT_COMPUTE_MODE = "numpy_spatial_v1"
 _DEFAULT_SPLIT_RATIOS = (0.70, 0.15, 0.15)
 _REQUIRED_PATCH_FILES = ("_img.tif", "_extent.tif", "_boundary.tif", "_distance.tif", "_valid.tif")
 _NORM_STATS_FILENAME = "norm_stats.json"
+_NORM_METHOD_EXACT = "exact_full_accumulation"
+_NORM_METHOD_RESERVOIR = "reservoir_sampling"
+_DEFAULT_NORM_EXACT_THRESHOLD_PIXELS = 1_000_000
+_DEFAULT_RESERVOIR_CAPACITY_PER_BAND = 200_000
 
 
 def load_patch_meta_list(
@@ -235,18 +239,43 @@ def _validate_patch_sample_shape_contract(
             )
 
 
+def _reservoir_update(
+    *,
+    reservoir: np.ndarray,
+    current_size: int,
+    seen_count: int,
+    values: np.ndarray,
+    rng: Any,
+) -> tuple[int, int]:
+    size = int(current_size)
+    seen = int(seen_count)
+    cap = int(reservoir.shape[0])
+    for value in values:
+        seen += 1
+        if size < cap:
+            reservoir[size] = float(value)
+            size += 1
+            continue
+        j = int(rng.integers(0, seen))
+        if j < cap:
+            reservoir[j] = float(value)
+    return size, seen
+
+
 def compute_normalization_stats(
     dataset_dir: Path,
     clip_percentiles: tuple[float, float] = (0.5, 99.5),
     *,
     progress_enabled: bool | None = None,
+    random_seed: int = 42,
+    exact_threshold_pixels: int = _DEFAULT_NORM_EXACT_THRESHOLD_PIXELS,
+    reservoir_capacity_per_band: int = _DEFAULT_RESERVOIR_CAPACITY_PER_BAND,
 ) -> dict:
-    """Compute per-band normalization statistics from valid train pixels.
+    """Compute per-band normalization stats in bounded memory.
 
-    Reads train/img/*.tif paired with train/valid/*.tif, accumulates
-    per-band float32 values where valid==1, then computes clip percentiles.
-
-    Returns dict written to dataset_dir/norm_stats.json.
+    Baseline policy:
+      - exact accumulation for small train-valid sets (<= exact_threshold_pixels);
+      - automatic fallback to per-band reservoir sampling above the threshold.
     """
     try:
         import numpy as np  # noqa: PLC0415
@@ -254,15 +283,32 @@ def compute_normalization_stats(
     except ImportError as exc:  # pragma: no cover
         raise ContractError("rasterio and numpy are required for normalization stats") from exc
 
+    if exact_threshold_pixels <= 0:
+        raise ContractError(
+            f"exact_threshold_pixels must be > 0, got {exact_threshold_pixels}."
+        )
+    if reservoir_capacity_per_band <= 0:
+        raise ContractError(
+            "reservoir_capacity_per_band must be > 0, got "
+            f"{reservoir_capacity_per_band}."
+        )
+
     train_img_dir = dataset_dir / "train" / "img"
     train_valid_dir = dataset_dir / "train" / "valid"
-
     img_files = sorted(train_img_dir.glob("*_img.tif"))
     if not img_files:
         raise ContractError(f"No img files found in {train_img_dir}")
 
-    band_accumulators: dict[int, list[np.ndarray]] = {}
-    n_valid_pixels = 0
+    p_lo, p_hi = clip_percentiles
+    rng = np.random.default_rng(seed=random_seed)
+
+    exact_mode = True
+    total_valid_pixels = 0
+    exact_values: dict[int, list[np.ndarray]] = {}
+    reservoir: dict[int, np.ndarray] = {}
+    reservoir_sizes: dict[int, int] = {}
+    reservoir_seen: dict[int, int] = {}
+    band_count: int | None = None
 
     for img_path in iter_progress(
         img_files,
@@ -272,48 +318,121 @@ def compute_normalization_stats(
         progress_enabled=progress_enabled,
         leave=False,
     ):
-        # Match valid file: same patch_id prefix
         patch_stem = img_path.stem.replace("_img", "")
         valid_path = train_valid_dir / f"{patch_stem}_valid.tif"
         if not valid_path.exists():
             continue
-
         try:
             with rasterio.open(img_path) as img_ds:
-                img_data = img_ds.read().astype(np.float32)  # (C, H, W)
+                img_data = img_ds.read().astype(np.float32)
             with rasterio.open(valid_path) as val_ds:
-                valid_mask = val_ds.read(1).astype(bool)  # (H, W)
+                valid_mask = val_ds.read(1).astype(bool)
         except Exception as exc:
             raise ContractError(f"Failed to read {img_path}: {exc}") from exc
 
-        pixel_count = int(valid_mask.sum())
-        n_valid_pixels += pixel_count
-        if pixel_count == 0:
+        if band_count is None:
+            band_count = int(img_data.shape[0])
+        elif band_count != int(img_data.shape[0]):
+            raise ContractError(
+                "Inconsistent band count across train/img patches during normalization."
+            )
+
+        n_patch_valid = int(valid_mask.sum())
+        if n_patch_valid <= 0:
+            continue
+        total_valid_pixels += n_patch_valid
+
+        if exact_mode and total_valid_pixels <= exact_threshold_pixels:
+            for band_idx in range(img_data.shape[0]):
+                vals = img_data[band_idx][valid_mask]
+                if vals.size == 0:
+                    continue
+                exact_values.setdefault(band_idx, []).append(vals)
             continue
 
+        # Switch to reservoir mode if threshold exceeded.
+        if exact_mode:
+            exact_mode = False
+            for band_idx in range(img_data.shape[0]):
+                reservoir[band_idx] = np.empty(
+                    reservoir_capacity_per_band, dtype=np.float32
+                )
+                reservoir_sizes[band_idx] = 0
+                reservoir_seen[band_idx] = 0
+                for chunk in exact_values.get(band_idx, []):
+                    size, seen = _reservoir_update(
+                        reservoir=reservoir[band_idx],
+                        current_size=reservoir_sizes[band_idx],
+                        seen_count=reservoir_seen[band_idx],
+                        values=chunk.astype(np.float32, copy=False),
+                        rng=rng,
+                    )
+                    reservoir_sizes[band_idx] = size
+                    reservoir_seen[band_idx] = seen
+            exact_values = {}
+
         for band_idx in range(img_data.shape[0]):
-            band_vals = img_data[band_idx][valid_mask]
-            band_accumulators.setdefault(band_idx, []).append(band_vals)
+            vals = img_data[band_idx][valid_mask]
+            if vals.size == 0:
+                continue
+            size, seen = _reservoir_update(
+                reservoir=reservoir[band_idx],
+                current_size=reservoir_sizes[band_idx],
+                seen_count=reservoir_seen[band_idx],
+                values=vals.astype(np.float32, copy=False),
+                rng=rng,
+            )
+            reservoir_sizes[band_idx] = size
+            reservoir_seen[band_idx] = seen
 
-    if not band_accumulators:
-        raise ContractError("No valid pixels found in train set for normalization stats.")
+    if band_count is None:
+        raise ContractError("No readable train/img patches for normalization stats.")
 
-    band_stats = []
-    p_lo, p_hi = clip_percentiles
-    for band_idx in sorted(band_accumulators.keys()):
-        all_vals = np.concatenate(band_accumulators[band_idx])
-        stats = {
-            "band_idx": band_idx,
-            "p_lo": float(np.percentile(all_vals, p_lo)),
-            "p_hi": float(np.percentile(all_vals, p_hi)),
-        }
-        band_stats.append(stats)
+    band_stats: list[dict[str, float | int]] = []
+    if exact_mode:
+        method = _NORM_METHOD_EXACT
+        approximation = False
+        for band_idx in range(band_count):
+            chunks = exact_values.get(band_idx, [])
+            if not chunks:
+                raise ContractError(
+                    f"No valid train pixels for band_idx={band_idx} in exact normalization mode."
+                )
+            all_vals = np.concatenate(chunks)
+            band_stats.append(
+                {
+                    "band_idx": int(band_idx),
+                    "p_lo": float(np.percentile(all_vals, p_lo)),
+                    "p_hi": float(np.percentile(all_vals, p_hi)),
+                }
+            )
+    else:
+        method = _NORM_METHOD_RESERVOIR
+        approximation = True
+        for band_idx in range(band_count):
+            if reservoir_sizes.get(band_idx, 0) <= 0:
+                raise ContractError(
+                    f"Reservoir sampling produced no samples for band_idx={band_idx}."
+                )
+            sample = reservoir[band_idx][: reservoir_sizes[band_idx]]
+            band_stats.append(
+                {
+                    "band_idx": int(band_idx),
+                    "p_lo": float(np.percentile(sample, p_lo)),
+                    "p_hi": float(np.percentile(sample, p_hi)),
+                }
+            )
 
     norm_stats = {
         "band_stats": band_stats,
-        "n_valid_pixels": n_valid_pixels,
+        "n_valid_pixels": int(total_valid_pixels),
         "computed_on": "valid_train_pixels",
-        "clip_percentiles": list(clip_percentiles),
+        "clip_percentiles": [float(p_lo), float(p_hi)],
+        "method": method,
+        "approximation": approximation,
+        "rng_seed": int(random_seed),
+        "exact_threshold_pixels": int(exact_threshold_pixels),
+        "reservoir_capacity_per_band": int(reservoir_capacity_per_band),
     }
 
     norm_stats_path = dataset_dir / _NORM_STATS_FILENAME
@@ -383,6 +502,7 @@ def compute_and_save_split(
         dataset_dir,
         clip_percentiles=tuple(float(v) for v in clip_percentiles_cfg),
         progress_enabled=progress_enabled,
+        random_seed=int(random_seed_val) if random_seed_val is not None else 42,
     )
 
     return {
@@ -390,6 +510,13 @@ def compute_and_save_split(
         "val_count": counts.get("val_count", 0),
         "test_count": counts.get("test_count", 0),
         "norm_stats_path": norm_stats.get("norm_stats_path"),
+        "normalization_method": norm_stats.get("method"),
+        "normalization_approximation": norm_stats.get("approximation"),
+        "normalization_rng_seed": norm_stats.get("rng_seed"),
+        "normalization_exact_threshold_pixels": norm_stats.get("exact_threshold_pixels"),
+        "normalization_reservoir_capacity_per_band": norm_stats.get(
+            "reservoir_capacity_per_band"
+        ),
         "split_assignment_executed": True,
         "export_layout_materialized": True,
         "split_compute_mode": SPLIT_COMPUTE_MODE,
