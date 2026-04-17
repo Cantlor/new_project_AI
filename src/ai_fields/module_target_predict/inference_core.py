@@ -530,7 +530,11 @@ def run_predict_forward(
     )
 
     extent_prob = torch.sigmoid(extent)
-    boundary_prob = torch.softmax(boundary, dim=1)
+    # Reduce 3-class boundary softmax to single-channel P(any boundary).
+    # P(any_boundary) = 1 − P(background) = P(skeleton) + P(buffer).
+    # DATA_CONTRACT.md §16.1: boundary_prob.tif is a single-channel raster.
+    boundary_softmax = torch.softmax(boundary, dim=1)
+    boundary_prob = 1.0 - boundary_softmax[:, 0:1, ...]  # keep (B,1,H,W) shape
 
     extent_logits_np = extent.detach().cpu().numpy()
     boundary_logits_np = boundary.detach().cpu().numpy()

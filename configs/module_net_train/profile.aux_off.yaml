@@ -1,0 +1,76 @@
+# module_net_train aux-off profile (targeted extent/aux investigation)
+#
+# Status: EXPERIMENTAL — DO NOT PROMOTE TO BASELINE without cross-scene confirmation.
+#
+# Purpose:
+#   Disable deep-supervision auxiliary loss contribution to test H1:
+#   coarse aux supervision may over-smooth extent predictions.
+#
+# Evidence basis:
+#   extent_aux_context_investigation_report.md (2026-04-16),
+#   same dataset/split/hardware, 20-epoch paired comparison vs baseline.
+#
+# Verified aggregate gains (vs auxctx-baseline-aux04-20ep, same split):
+#   composite: +0.0108  boundary_f1: +0.0194  extent_precision: +0.0009
+#   prec-rec gap: -0.0213 (aux_off) vs -0.0273 (baseline) — slightly tighter
+#
+# KNOWN TAIL-RISK — high-coverage patches:
+#   At threshold 0.55: fraction(delta_recall < -0.20) = 3.37% of high-bucket val patches.
+#   Severe under-segmentation confirmed on specific high-coverage patches (e.g. patch_004825:
+#   recall 0.054 vs baseline 0.720). Bidirectional per-case behaviour observed.
+#   Root cause: confirmed geographic regime mismatch (val-high y-range extends beyond
+#   train-high y-range), not fixable by loss change alone.
+#
+# Pre-promotion requirements:
+#   1. Cross-scene confirmation with different dataset/split.
+#   2. Split-policy redesign (spatially-aware high-coverage balancing) — see
+#      module_net_train_high_coverage_next_step.md for recommended next step.
+#
+# What changes vs baseline.raw8.yaml:
+#   loss.aux_weight: 0.4 -> 0.0
+#
+# What does NOT change:
+#   - architecture, heads, and multitask setup (extent/boundary/distance)
+#   - feature contract and valid semantics
+#   - monitored metric policy
+#   - optimizer/scheduler/runtime policy defaults
+
+feature_mode: raw8
+valid_as_input_channel: true
+
+model:
+  architecture: edge_aware_multitask_v1
+  encoder_depth: 4
+  base_channels: 32
+
+loss:
+  extent_weight: 1.0
+  boundary_weight: 2.5
+  distance_weight: 1.0
+  aux_weight: 0.0
+  boundary_lambda_skel_dice: 0.5
+
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+
+scheduler:
+  name: cosine_with_warmup
+  warmup_epochs: 5
+  min_lr: 0.000001
+
+training:
+  batch_size: 8
+  num_epochs: 20
+  gradient_clip: 1.0
+  amp: true
+  seed: 42
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  device: null
+  augment: true
+
+monitoring:
+  monitored_metric_name: composite_boundary_extent_f1
+  monitored_metric_mode: max

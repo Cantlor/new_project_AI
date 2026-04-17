@@ -458,8 +458,11 @@ def export_training_artifacts(
     val_summary: Mapping[str, Any] | None = None,
     eval_val_summary: Mapping[str, Any] | None = None,
     eval_val_path: str | Path | None = None,
+    bucket_metrics_val_summary: Mapping[str, Any] | None = None,
+    bucket_metrics_val_path: str | Path | None = None,
     eval_test_summary: Mapping[str, Any] | None = None,
     eval_test_path: str | Path | None = None,
+    coverage_aware_sampling: Mapping[str, Any] | None = None,
     monitored_metric_policy_note: str | None = None,
     scheduler_step_policy: str | None = None,
     scheduler_last_lr: float | None = None,
@@ -557,6 +560,11 @@ def export_training_artifacts(
         if eval_val_path is not None
         else None
     )
+    resolved_bucket_metrics_val_path = (
+        _normalize_path(bucket_metrics_val_path, name="bucket_metrics_val_path")
+        if bucket_metrics_val_path is not None
+        else None
+    )
     resolved_eval_test_path = (
         _normalize_path(eval_test_path, name="eval_test_path")
         if eval_test_path is not None
@@ -569,6 +577,16 @@ def export_training_artifacts(
     if eval_test_summary is not None and not isinstance(eval_test_summary, Mapping):
         raise ContractError(
             f"eval_test_summary must be a mapping/object, got {type(eval_test_summary).__name__}."
+        )
+    if bucket_metrics_val_summary is not None and not isinstance(bucket_metrics_val_summary, Mapping):
+        raise ContractError(
+            "bucket_metrics_val_summary must be a mapping/object, "
+            f"got {type(bucket_metrics_val_summary).__name__}."
+        )
+    if coverage_aware_sampling is not None and not isinstance(coverage_aware_sampling, Mapping):
+        raise ContractError(
+            "coverage_aware_sampling must be a mapping/object when provided, "
+            f"got {type(coverage_aware_sampling).__name__}."
         )
 
     runtime_device_requested = (
@@ -670,6 +688,20 @@ def export_training_artifacts(
     spatial_contract = _resolve_spatial_contract(
         source_manifest_path=source_manifest_path,
         dataset_patch_size=dataset_patch_size,
+    )
+    loss_cfg = getattr(config, "loss", None)
+    aux_weight_scalar = getattr(loss_cfg, "aux_weight", None)
+    extent_aux_weight_cfg = getattr(loss_cfg, "extent_aux_weight", None)
+    boundary_aux_weight_cfg = getattr(loss_cfg, "boundary_aux_weight", None)
+    distance_aux_weight_cfg = getattr(loss_cfg, "distance_aux_weight", None)
+    resolved_extent_aux_weight = (
+        aux_weight_scalar if extent_aux_weight_cfg is None else extent_aux_weight_cfg
+    )
+    resolved_boundary_aux_weight = (
+        aux_weight_scalar if boundary_aux_weight_cfg is None else boundary_aux_weight_cfg
+    )
+    resolved_distance_aux_weight = (
+        aux_weight_scalar if distance_aux_weight_cfg is None else distance_aux_weight_cfg
     )
 
     checkpoint_path = resolved_run_dir / checkpoint_filename
@@ -779,6 +811,16 @@ def export_training_artifacts(
                 "exists": resolved_eval_val_path.exists(),
             }
         )
+    if resolved_bucket_metrics_val_path is not None:
+        outputs_artifacts.append(
+            {
+                "path": str(resolved_bucket_metrics_val_path),
+                "role": "bucket_metrics_val",
+                "format": "json",
+                "is_required": False,
+                "exists": resolved_bucket_metrics_val_path.exists(),
+            }
+        )
     if resolved_eval_test_path is not None:
         outputs_artifacts.append(
             {
@@ -817,7 +859,11 @@ def export_training_artifacts(
                 "heads": ["extent", "boundary", "distance"],
             },
             "loss": {
-                "extent_loss_name": "focal_bce_plus_soft_dice",
+                "extent_loss_name": (
+                    "plain_bce_plus_soft_dice"
+                    if getattr(getattr(config, "loss", None), "extent_loss_mode", "current") == "legacy_bce_dice"
+                    else "focal_bce_plus_soft_dice"
+                ),
                 "boundary_loss_name": "weighted_focal_ce_plus_skeleton_soft_dice",
                 "distance_loss_name": "smooth_l1",
                 "loss_weights": {
@@ -825,6 +871,19 @@ def export_training_artifacts(
                     "boundary": getattr(getattr(config, "loss", None), "boundary_weight", None),
                     "distance": getattr(getattr(config, "loss", None), "distance_weight", None),
                 },
+                "aux_weight": aux_weight_scalar,
+                "aux_head_weights_config": {
+                    "extent": extent_aux_weight_cfg,
+                    "boundary": boundary_aux_weight_cfg,
+                    "distance": distance_aux_weight_cfg,
+                },
+                "aux_head_weights_resolved": {
+                    "extent": resolved_extent_aux_weight,
+                    "boundary": resolved_boundary_aux_weight,
+                    "distance": resolved_distance_aux_weight,
+                },
+                "extent_focal_alpha": getattr(getattr(config, "loss", None), "extent_focal_alpha", 0.25),
+                "extent_loss_mode": getattr(getattr(config, "loss", None), "extent_loss_mode", "current"),
             },
             "optimizer": {
                 "name": getattr(getattr(config, "optimizer", None), "name", None),
@@ -843,6 +902,11 @@ def export_training_artifacts(
                 "epochs_completed": epochs_completed,
                 "amp_used": runtime_amp_used,
                 "augment": bool(getattr(getattr(config, "training", None), "augment", True)),
+                "coverage_aware_sampling": (
+                    dict(coverage_aware_sampling)
+                    if coverage_aware_sampling is not None
+                    else {"enabled": False}
+                ),
                 "best_checkpoint_metric": best_metric_name,
                 "best_metric_value": best_metric_value,
                 "best_epoch": best_epoch,
@@ -909,6 +973,11 @@ def export_training_artifacts(
             "diagnostics": {"warnings": [], "errors": []},
             "history_path": str(resolved_history_path) if resolved_history_path is not None else None,
             "eval_val_path": str(resolved_eval_val_path) if resolved_eval_val_path is not None else None,
+            "bucket_metrics_val_path": (
+                str(resolved_bucket_metrics_val_path)
+                if resolved_bucket_metrics_val_path is not None
+                else None
+            ),
             "eval_test_path": str(resolved_eval_test_path) if resolved_eval_test_path is not None else None,
             "last_checkpoint_path": str(resolved_last_checkpoint_path)
             if resolved_last_checkpoint_path is not None
@@ -920,6 +989,11 @@ def export_training_artifacts(
             "train_summary": dict(train_summary) if train_summary is not None else None,
             "val_summary": dict(val_summary) if val_summary is not None else None,
             "eval_val_summary": dict(eval_val_summary) if eval_val_summary is not None else None,
+            "bucket_metrics_val_summary": (
+                dict(bucket_metrics_val_summary)
+                if bucket_metrics_val_summary is not None
+                else None
+            ),
             "eval_test_summary": dict(eval_test_summary) if eval_test_summary is not None else None,
         }
     )
@@ -952,6 +1026,11 @@ def export_training_artifacts(
         "oom_fallbacks_applied": runtime_oom_fallbacks,
         "history_path": str(resolved_history_path) if resolved_history_path is not None else None,
         "eval_val_path": str(resolved_eval_val_path) if resolved_eval_val_path is not None else None,
+        "bucket_metrics_val_path": (
+            str(resolved_bucket_metrics_val_path)
+            if resolved_bucket_metrics_val_path is not None
+            else None
+        ),
         "eval_test_path": str(resolved_eval_test_path) if resolved_eval_test_path is not None else None,
         "epochs_completed": epochs_completed,
         "warnings": warnings_list,
@@ -963,6 +1042,11 @@ def export_training_artifacts(
         "train": dict(train_summary) if train_summary is not None else None,
         "val": dict(val_summary) if val_summary is not None else None,
         "eval_val": dict(eval_val_summary) if eval_val_summary is not None else None,
+        "bucket_metrics_val": (
+            dict(bucket_metrics_val_summary)
+            if bucket_metrics_val_summary is not None
+            else None
+        ),
         "eval_test": dict(eval_test_summary) if eval_test_summary is not None else None,
         "best_val_metrics": (
             {

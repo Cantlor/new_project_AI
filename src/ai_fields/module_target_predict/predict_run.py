@@ -79,7 +79,7 @@ def write_predict_raster_outputs(
 
     Writes:
         - ``extent_prob.tif``   (1 band, float32)
-        - ``boundary_prob.tif`` (3 bands, float32)
+        - ``boundary_prob.tif`` (1 band, float32)  — P(any boundary) = 1 − P(background)
         - ``distance_pred.tif`` (1 band, float32)
         - ``valid.tif``         (1 band, uint8)
 
@@ -133,16 +133,16 @@ def write_predict_raster_outputs(
         )
     written["extent_prob"] = extent_path
 
-    # 2. boundary_prob.tif — 3 bands float32
+    # 2. boundary_prob.tif — single band float32, P(any boundary) = 1 − P(background)
+    # DATA_CONTRACT.md §16.1: boundary_prob.tif is a single-channel canonical output.
     boundary_path = output_dir / "boundary_prob.tif"
-    with _rio.open(boundary_path, "w", count=3, dtype="float32", **base_kwargs) as ds:
-        for band_idx in range(3):
-            _write_band_windowed(
-                ds,
-                array2d=result.boundary_prob[band_idx],
-                band_index=band_idx + 1,
-                dtype="float32",
-            )
+    with _rio.open(boundary_path, "w", count=1, dtype="float32", **base_kwargs) as ds:
+        _write_band_windowed(
+            ds,
+            array2d=result.boundary_prob,
+            band_index=1,
+            dtype="float32",
+        )
     written["boundary_prob"] = boundary_path
 
     # 3. distance_pred.tif — single band float32
@@ -404,6 +404,10 @@ def run_predict_for_scene(
                 "final_input_channel_count": checkpoint_contract.in_channels,
                 "channel_semantics": list(checkpoint_contract.channel_semantics),
                 "valid_as_input_channel": checkpoint_contract.valid_as_input_channel,
+                # boundary_prob.tif is single-channel P(any boundary) = 1 - P(background).
+                # Downstream postprocess must interpret this field, not guess band count.
+                "boundary_prob_semantic": "p_any_boundary",
+                "boundary_prob_bands": 1,
             },
             "normalization": {
                 "normalization_name": checkpoint_contract.normalization.get(

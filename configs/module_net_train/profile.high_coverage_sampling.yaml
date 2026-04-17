@@ -1,0 +1,67 @@
+# module_net_train profile: conservative high-coverage-aware train sampling
+#
+# Status: PROMOTED TO BASELINE (2026-04-17)
+#   Settings from this profile are now in baseline.raw8.yaml.
+#   This file is retained as a named reference and for backward compatibility.
+#   For new runs, prefer: configs/module_net_train/baseline.raw8.yaml
+#
+# Promotion report: module_net_train_highcov_baseline_promotion.md
+# Evidence basis:
+#   module_net_train_manual_full_run_comparison.md (2026-04-17),
+#   direct pair comparison on same dataset/split: composite +0.014, bnd_f1 +0.023.
+#
+# Known limitations (documented in baseline.raw8.yaml and promotion report):
+#   - High-bucket F1 slight regression at t=0.55 (-0.005)
+#   - Per-case tail-risk bidirectional; root cause (geographic split mismatch) unaddressed
+#   - Next step: split-policy redesign (see module_net_train_high_coverage_next_step.md)
+#
+# Contract-safe extension over baseline.raw8 (architecture/loss/feature contract unchanged).
+
+feature_mode: raw8
+valid_as_input_channel: true
+
+model:
+  architecture: edge_aware_multitask_v1
+  encoder_depth: 4
+  base_channels: 32
+
+loss:
+  extent_weight: 1.0
+  boundary_weight: 2.5
+  distance_weight: 1.0
+  aux_weight: 0.4
+  boundary_lambda_skel_dice: 0.5
+
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+
+scheduler:
+  name: cosine_with_warmup
+  warmup_epochs: 5
+  min_lr: 0.000001
+
+training:
+  batch_size: 8
+  num_epochs: 20
+  gradient_clip: 1.0
+  amp: true
+  seed: 42
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  device: null
+  augment: true
+  coverage_aware_sampling:
+    enabled: true
+    coverage_quantile_low: 0.3333333333
+    coverage_quantile_high: 0.6666666667
+    bucket_weights:
+      low: 1.0
+      medium: 1.0
+      high: 1.5
+    replacement: true
+
+monitoring:
+  monitored_metric_name: composite_boundary_extent_f1
+  monitored_metric_mode: max

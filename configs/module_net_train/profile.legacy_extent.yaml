@@ -1,0 +1,53 @@
+# module_net_train — Legacy extent loss ablation
+# Assembled model input: raw8_valid (8 spectral + valid = 9 channels)
+#
+# What changes vs baseline.raw8.yaml:
+#   loss.extent_loss_mode: legacy_bce_dice
+#     Plain (non-focal) BCE + soft Dice over valid pixels.
+#     Matches the old model's extent_loss() in my_project/module_net_train/losses/extent_loss.py.
+#     focal_alpha and focal_gamma are ignored in this mode.
+#
+# Everything else is identical to baseline.raw8.yaml.
+# Purpose: test whether removing the focal alpha bias on the extent head
+#   improves the precision/recall gap (extent too soft / over-inclusive).
+
+feature_mode: raw8
+valid_as_input_channel: true
+
+model:
+  architecture: edge_aware_multitask_v1
+  encoder_depth: 4
+  base_channels: 32
+
+loss:
+  extent_weight: 1.0
+  boundary_weight: 2.5
+  distance_weight: 1.0
+  aux_weight: 0.4
+  boundary_lambda_skel_dice: 0.5
+  extent_loss_mode: legacy_bce_dice   # ← only change vs baseline
+
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+
+scheduler:
+  name: cosine_with_warmup
+  warmup_epochs: 5
+  min_lr: 0.000001
+
+training:
+  batch_size: 8
+  num_epochs: 20
+  gradient_clip: 1.0
+  amp: true
+  seed: 42
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  device: null
+  augment: true
+
+monitoring:
+  monitored_metric_name: composite_boundary_extent_f1
+  monitored_metric_mode: max

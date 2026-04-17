@@ -147,6 +147,31 @@ def soft_dice_loss_binary(
     return 1.0 - (2.0 * intersection + smooth) / denom
 
 
+def plain_bce_loss(
+    pred_logits: "torch.Tensor",
+    target_binary: "torch.Tensor",
+    mask: "torch.Tensor",
+) -> "torch.Tensor":
+    """Plain (non-focal) Binary Cross-Entropy averaged over valid pixels.
+
+    Matches the old model's BCE term in my_project/module_net_train/losses/extent_loss.py.
+    No alpha weighting, no focal modulation.
+
+    Parameters
+    ----------
+    pred_logits: (B, H, W) float32
+    target_binary: (B, H, W) 0/1
+    mask: (B, H, W) bool
+
+    Returns
+    -------
+    Masked mean scalar.  0.0 if mask is empty.
+    """
+    _require_torch()
+    bce = F.binary_cross_entropy_with_logits(pred_logits, target_binary.float(), reduction="none")
+    return _safe_mean(bce, mask)
+
+
 def extent_loss(
     pred_logits: "torch.Tensor",
     target: "torch.Tensor",
@@ -155,8 +180,19 @@ def extent_loss(
     dice_weight: float = 0.5,
     focal_gamma: float = 2.0,
     focal_alpha: float = 0.25,
+    mode: str = "current",
 ) -> "torch.Tensor":
-    """Focal BCE + soft Dice for extent head.
+    """Extent head loss.
+
+    Two modes controlled by ``mode``:
+
+    ``"current"`` (baseline v1):
+        Focal BCE (alpha, gamma) + soft Dice.  bce_weight=0.5, dice_weight=0.5.
+
+    ``"legacy_bce_dice"``:
+        Plain (non-focal) BCE + soft Dice over valid pixels.  Matches the old
+        model's extent_loss() in my_project/module_net_train/losses/extent_loss.py.
+        focal_alpha / focal_gamma are ignored in this mode.
 
     Ignore policy (DATA_CONTRACT.md §8.2, module_net_train.md §9):
       - valid == 0 excluded
@@ -167,10 +203,12 @@ def extent_loss(
     pred_logits: (B, H, W) or (B, 1, H, W) float32
     target: (B, H, W) int64  —  0=background, 1=foreground, 255=ignore
     valid: (B, H, W) bool
+    mode: "current" or "legacy_bce_dice"
 
     Raises
     ------
     ContractError if valid region is completely empty (§19).
+    ContractError if mode is not a recognised value.
     """
     _require_torch()
     _check_nonempty_valid(valid, "extent_loss")
@@ -182,7 +220,17 @@ def extent_loss(
     mask = valid & (target != EXTENT_IGNORE_LABEL)
 
     binary_target = (target == 1).long()
-    bce = focal_bce_loss(pred_logits, binary_target, mask, gamma=focal_gamma, alpha=focal_alpha)
+
+    if mode == "current":
+        bce = focal_bce_loss(pred_logits, binary_target, mask, gamma=focal_gamma, alpha=focal_alpha)
+    elif mode == "legacy_bce_dice":
+        bce = plain_bce_loss(pred_logits, binary_target, mask)
+    else:
+        raise ContractError(
+            f"extent_loss: unknown mode '{mode}'.  "
+            "Accepted values: 'current', 'legacy_bce_dice'."
+        )
+
     dice = soft_dice_loss_binary(pred_logits, binary_target, mask)
     return bce_weight * bce + dice_weight * dice
 
@@ -383,12 +431,16 @@ class MultitaskLoss:
         boundary_weight: float = 2.5,
         distance_weight: float = 1.0,
         lambda_skel_dice: float = 0.5,
+        extent_focal_alpha: float = 0.25,
+        extent_loss_mode: str = "current",
     ) -> None:
         _require_torch()
         self.extent_weight = extent_weight
         self.boundary_weight = boundary_weight
         self.distance_weight = distance_weight
         self.lambda_skel_dice = lambda_skel_dice
+        self.extent_focal_alpha = extent_focal_alpha
+        self.extent_loss_mode = extent_loss_mode
 
     @classmethod
     def from_config(cls, config: Any) -> "MultitaskLoss":
@@ -398,6 +450,8 @@ class MultitaskLoss:
             boundary_weight=config.boundary_weight,
             distance_weight=config.distance_weight,
             lambda_skel_dice=getattr(config, "boundary_lambda_skel_dice", 0.5),
+            extent_focal_alpha=getattr(config, "extent_focal_alpha", 0.25),
+            extent_loss_mode=getattr(config, "extent_loss_mode", "current"),
         )
 
     def forward(
@@ -436,7 +490,9 @@ class MultitaskLoss:
         _require_torch()
         _check_nonempty_valid(valid_mask, "MultitaskLoss.forward")
 
-        l_extent = extent_loss(preds["extent"], targets["extent"], valid_mask)
+        l_extent = extent_loss(preds["extent"], targets["extent"], valid_mask,
+                               focal_alpha=self.extent_focal_alpha,
+                               mode=self.extent_loss_mode)
         l_boundary = boundary_loss(
             preds["boundary"], targets["boundary"], valid_mask,
             lambda_skel_dice=self.lambda_skel_dice,

@@ -347,6 +347,55 @@ def _macro2(a: float, b: float) -> float:
     return 0.5 * (float(a) + float(b))
 
 
+def _require_non_negative_aux_weight(value: Any, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ContractError(f"{name} must be a number.")
+    value_f = float(value)
+    if value_f < 0:
+        raise ContractError(f"{name} must be >= 0.")
+    return value_f
+
+
+def _resolve_aux_head_weights(
+    *,
+    aux_weight: float,
+    extent_aux_weight: float | None,
+    boundary_aux_weight: float | None,
+    distance_aux_weight: float | None,
+) -> tuple[float, float, float]:
+    scalar = _require_non_negative_aux_weight(aux_weight, name="aux_weight")
+    extent_w = (
+        scalar
+        if extent_aux_weight is None
+        else _require_non_negative_aux_weight(extent_aux_weight, name="extent_aux_weight")
+    )
+    boundary_w = (
+        scalar
+        if boundary_aux_weight is None
+        else _require_non_negative_aux_weight(boundary_aux_weight, name="boundary_aux_weight")
+    )
+    distance_w = (
+        scalar
+        if distance_aux_weight is None
+        else _require_non_negative_aux_weight(distance_aux_weight, name="distance_aux_weight")
+    )
+    return extent_w, boundary_w, distance_w
+
+
+def _resolve_main_head_loss_weights(loss_fn: Any) -> tuple[float, float, float]:
+    for attr in ("extent_weight", "boundary_weight", "distance_weight"):
+        value = getattr(loss_fn, attr, None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ContractError(
+                f"loss_fn.{attr} must be numeric for auxiliary-loss weighting."
+            )
+    return (
+        float(loss_fn.extent_weight),
+        float(loss_fn.boundary_weight),
+        float(loss_fn.distance_weight),
+    )
+
+
 def _compute_batch_metric_counts(
     *,
     preds: Mapping[str, "torch.Tensor"],
@@ -415,6 +464,9 @@ def _compute_losses(
     device: "torch.device",
     amp_enabled: bool,
     aux_weight: float,
+    extent_aux_weight: float | None = None,
+    boundary_aux_weight: float | None = None,
+    distance_aux_weight: float | None = None,
     input_normalizer: Any | None = None,
 ) -> tuple[dict[str, "torch.Tensor"], int, int, int, dict[str, int]]:
     model_inputs, targets, valid_mask, batch_size = _prepare_batch(
@@ -422,6 +474,19 @@ def _compute_losses(
         device=device,
         input_normalizer=input_normalizer,
     )
+    resolved_extent_aux_weight, resolved_boundary_aux_weight, resolved_distance_aux_weight = (
+        _resolve_aux_head_weights(
+            aux_weight=aux_weight,
+            extent_aux_weight=extent_aux_weight,
+            boundary_aux_weight=boundary_aux_weight,
+            distance_aux_weight=distance_aux_weight,
+        )
+    )
+    (
+        main_extent_weight,
+        main_boundary_weight,
+        main_distance_weight,
+    ) = _resolve_main_head_loss_weights(loss_fn)
 
     with _autocast_context(amp_enabled=amp_enabled, device=device):
         model_out = model(model_inputs["image"])
@@ -459,7 +524,11 @@ def _compute_losses(
             aux_raw = []
         if isinstance(aux_raw, list):
             n_aux = len(aux_raw)
-            if n_aux > 0 and aux_weight > 0:
+            if n_aux > 0 and (
+                resolved_extent_aux_weight > 0
+                or resolved_boundary_aux_weight > 0
+                or resolved_distance_aux_weight > 0
+            ):
                 for idx, aux_preds in enumerate(aux_raw):
                     if not isinstance(aux_preds, Mapping):
                         raise ContractError(
@@ -477,11 +546,14 @@ def _compute_losses(
                         valid_mask,
                     )
                     _require_finite_tensor(aux_res["total"], name=f"aux[{idx}] total loss")
-                    w = float(aux_weight)
-                    extent_loss = extent_loss + w * aux_res["extent"]
-                    boundary_loss = boundary_loss + w * aux_res["boundary"]
-                    distance_loss = distance_loss + w * aux_res["distance"]
-                    weighted_aux_total = w * aux_res["total"]
+                    extent_loss = extent_loss + resolved_extent_aux_weight * aux_res["extent"]
+                    boundary_loss = boundary_loss + resolved_boundary_aux_weight * aux_res["boundary"]
+                    distance_loss = distance_loss + resolved_distance_aux_weight * aux_res["distance"]
+                    weighted_aux_total = (
+                        resolved_extent_aux_weight * main_extent_weight * aux_res["extent"]
+                        + resolved_boundary_aux_weight * main_boundary_weight * aux_res["boundary"]
+                        + resolved_distance_aux_weight * main_distance_weight * aux_res["distance"]
+                    )
                     total_loss = total_loss + weighted_aux_total
                     aux_losses_total = aux_losses_total + weighted_aux_total
         else:
@@ -582,6 +654,9 @@ def train_step(
     device: "torch.device | str | None" = None,
     amp_enabled: bool = False,
     aux_weight: float = 0.0,
+    extent_aux_weight: float | None = None,
+    boundary_aux_weight: float | None = None,
+    distance_aux_weight: float | None = None,
     gradient_clip_norm: float | None = None,
     input_normalizer: Any | None = None,
 ) -> dict[str, Any]:
@@ -599,6 +674,9 @@ def train_step(
         device=resolved_device,
         amp_enabled=amp_enabled,
         aux_weight=aux_weight,
+        extent_aux_weight=extent_aux_weight,
+        boundary_aux_weight=boundary_aux_weight,
+        distance_aux_weight=distance_aux_weight,
         input_normalizer=input_normalizer,
     )
     losses["total"].backward()
@@ -625,6 +703,9 @@ def train_one_epoch(
     device: "torch.device | str | None" = None,
     amp_enabled: bool = False,
     aux_weight: float = 0.0,
+    extent_aux_weight: float | None = None,
+    boundary_aux_weight: float | None = None,
+    distance_aux_weight: float | None = None,
     gradient_clip_norm: float | None = None,
     gradient_accumulation_steps: int = 1,
     progress_enabled: bool | None = None,
@@ -691,6 +772,9 @@ def train_one_epoch(
                 device=resolved_device,
                 amp_enabled=amp_enabled,
                 aux_weight=aux_weight,
+                extent_aux_weight=extent_aux_weight,
+                boundary_aux_weight=boundary_aux_weight,
+                distance_aux_weight=distance_aux_weight,
                 input_normalizer=input_normalizer,
             )
             if step_idx == 1:
@@ -806,6 +890,9 @@ def evaluate_one_epoch(
     device: "torch.device | str | None" = None,
     amp_enabled: bool = False,
     aux_weight: float = 0.0,
+    extent_aux_weight: float | None = None,
+    boundary_aux_weight: float | None = None,
+    distance_aux_weight: float | None = None,
     progress_enabled: bool | None = None,
     input_normalizer: Any | None = None,
 ) -> dict[str, Any]:
@@ -859,6 +946,9 @@ def evaluate_one_epoch(
                 device=resolved_device,
                 amp_enabled=amp_enabled,
                 aux_weight=aux_weight,
+                extent_aux_weight=extent_aux_weight,
+                boundary_aux_weight=boundary_aux_weight,
+                distance_aux_weight=distance_aux_weight,
                 input_normalizer=input_normalizer,
             )
             if n_batches == 0:

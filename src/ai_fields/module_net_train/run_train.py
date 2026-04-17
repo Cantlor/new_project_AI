@@ -20,7 +20,13 @@ from typing import Any
 from ai_fields.common.constants import CHANNEL_COUNTS, FEATURE_MODES
 from ai_fields.common.errors import ContractError
 from ai_fields.common.progress import progress_bar
-from ai_fields.module_net_train.dataset import FieldsDataset, fields_collate_fn
+from ai_fields.module_net_train.dataset import (
+    FieldsDataset,
+    assemble_model_input,
+    fields_collate_fn,
+    list_sample_ids,
+    read_sample,
+)
 from ai_fields.module_net_train.export import (
     NetTrainExportArtifacts,
     build_checkpoint_payload,
@@ -30,6 +36,7 @@ from ai_fields.module_net_train.export import (
 from ai_fields.module_net_train.losses import MultitaskLoss
 from ai_fields.module_net_train.model import build_model
 from ai_fields.module_net_train.schemas import (
+    CoverageAwareSamplingConfig,
     DEPRECATED_MONITORED_METRIC_NAMES,
     MONITORED_METRIC_COMPOSITE_BOUNDARY_EXTENT_F1,
     MONITORED_METRIC_EXPECTED_MODE,
@@ -120,6 +127,7 @@ class NetTrainRunResult:
     config_used_path: Path
     history_path: Path
     eval_val_path: Path
+    bucket_metrics_val_path: Path
     epochs_completed: int
     best_metric_name: str
     best_metric_value: float
@@ -451,8 +459,6 @@ def validate_train_ready_dataset_contract(
     _validate_split_layer_dirs(train_path, split_name="train")
     _validate_split_layer_dirs(val_path, split_name="val")
 
-    from ai_fields.module_net_train.dataset import list_sample_ids
-
     train_ids = list_sample_ids(train_path)
     val_ids = list_sample_ids(val_path)
     resolved_patch_size: int | None = None
@@ -513,19 +519,316 @@ def _build_dataloader(
     num_workers: int,
     shuffle: bool,
     augment: bool = False,
+    sampler: Any | None = None,
 ) -> Any:
     dataset = FieldsDataset(split_dir=split_dir, feature_mode=feature_mode, augment=augment)
     if len(dataset) == 0:
         raise ContractError(f"Split dataset is empty: {split_dir}")
+    if sampler is not None and shuffle:
+        shuffle = False
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=fields_collate_fn,
         pin_memory=False,
         drop_last=False,
     )
+
+
+def _safe_div(num: float, den: float) -> float:
+    if den <= 0:
+        return 0.0
+    return float(num) / float(den)
+
+
+def _coverage_bucket_for(
+    coverage: float,
+    *,
+    q_low: float,
+    q_high: float,
+) -> str:
+    if coverage <= q_low:
+        return "low"
+    if coverage <= q_high:
+        return "medium"
+    return "high"
+
+
+def _resolve_coverage_aware_sampling_config(training_cfg: Any) -> CoverageAwareSamplingConfig:
+    raw_cfg = getattr(training_cfg, "coverage_aware_sampling", None)
+    if raw_cfg is None:
+        cfg = CoverageAwareSamplingConfig()
+        cfg.validate()
+        return cfg
+    if isinstance(raw_cfg, CoverageAwareSamplingConfig):
+        raw_cfg.validate()
+        return raw_cfg
+    if isinstance(raw_cfg, Mapping):
+        cfg = CoverageAwareSamplingConfig(**dict(raw_cfg))
+        cfg.validate()
+        return cfg
+    raise ContractError(
+        "training.coverage_aware_sampling must be a mapping/object or "
+        "CoverageAwareSamplingConfig."
+    )
+
+
+def _sample_extent_coverage(
+    *,
+    split_dir: Path,
+    sample_id: str,
+) -> float:
+    _require_rasterio()
+    extent_path = split_dir / "extent" / f"{sample_id}_extent.tif"
+    valid_path = split_dir / "valid" / f"{sample_id}_valid.tif"
+    if not extent_path.exists() or not valid_path.exists():
+        raise ContractError(
+            f"Missing extent/valid raster for coverage sampling: sample_id={sample_id!r}."
+        )
+    with rasterio.open(extent_path) as ds_extent, rasterio.open(valid_path) as ds_valid:  # type: ignore[union-attr]
+        extent = ds_extent.read(1) > 0
+        valid = ds_valid.read(1) > 0
+    valid_count = int(valid.sum())
+    if valid_count <= 0:
+        return 0.0
+    return _safe_div(float((extent & valid).sum()), float(valid_count))
+
+
+def _compute_split_coverages(
+    *,
+    split_dir: Path,
+    sample_ids: list[str],
+    progress_enabled: bool | None,
+    progress_desc: str,
+) -> dict[str, float]:
+    if np is None:
+        raise ContractError("numpy is required for coverage-aware sampling diagnostics.")
+    coverages: dict[str, float] = {}
+    with progress_bar(
+        total=len(sample_ids),
+        desc=progress_desc,
+        unit="sample",
+        progress_enabled=progress_enabled,
+        leave=False,
+    ) as bar:
+        for sample_id in sample_ids:
+            coverages[sample_id] = _sample_extent_coverage(split_dir=split_dir, sample_id=sample_id)
+            bar.update(1)
+    return coverages
+
+
+def _build_coverage_aware_train_sampler(
+    *,
+    split_dir: Path,
+    seed: int,
+    coverage_cfg: CoverageAwareSamplingConfig,
+    progress_enabled: bool | None,
+) -> tuple[Any | None, dict[str, Any]]:
+    coverage_cfg.validate()
+    if not coverage_cfg.enabled:
+        return None, {
+            "enabled": False,
+            "reason": "disabled_by_config",
+            "bucket_weights": dict(coverage_cfg.bucket_weights),
+            "replacement": bool(coverage_cfg.replacement),
+            "coverage_quantile_low": float(coverage_cfg.coverage_quantile_low),
+            "coverage_quantile_high": float(coverage_cfg.coverage_quantile_high),
+        }
+
+    if np is None:
+        raise ContractError("numpy is required for coverage-aware sampling.")
+    _require_torch()
+
+    sample_ids = list_sample_ids(split_dir)
+    if len(sample_ids) == 0:
+        raise ContractError(f"Cannot build coverage-aware sampler for empty split: {split_dir}")
+
+    coverages = _compute_split_coverages(
+        split_dir=split_dir,
+        sample_ids=sample_ids,
+        progress_enabled=progress_enabled,
+        progress_desc="net_train: train coverage buckets",
+    )
+    coverage_values = np.asarray([coverages[sid] for sid in sample_ids], dtype=np.float64)
+    q_low = float(np.quantile(coverage_values, float(coverage_cfg.coverage_quantile_low)))
+    q_high = float(np.quantile(coverage_values, float(coverage_cfg.coverage_quantile_high)))
+    if q_high < q_low:
+        raise ContractError(
+            "Coverage quantiles resolved to invalid order for coverage-aware sampling: "
+            f"q_low={q_low}, q_high={q_high}."
+        )
+
+    bucket_weights = {k: float(v) for k, v in coverage_cfg.bucket_weights.items()}
+    bucket_counts = {"low": 0, "medium": 0, "high": 0}
+    sample_weights: list[float] = []
+    for sample_id in sample_ids:
+        coverage = float(coverages[sample_id])
+        bucket = _coverage_bucket_for(coverage, q_low=q_low, q_high=q_high)
+        bucket_counts[bucket] += 1
+        sample_weights.append(bucket_weights[bucket])
+
+    torch_weights = torch.as_tensor(sample_weights, dtype=torch.double)
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=torch_weights,
+        num_samples=len(sample_ids),
+        replacement=bool(coverage_cfg.replacement),
+        generator=generator,
+    )
+
+    diagnostics = {
+        "enabled": True,
+        "strategy": "coverage_bucket_weighted_random_sampler",
+        "coverage_quantile_low": float(coverage_cfg.coverage_quantile_low),
+        "coverage_quantile_high": float(coverage_cfg.coverage_quantile_high),
+        "resolved_coverage_quantiles": {"q_low": q_low, "q_high": q_high},
+        "bucket_definition": "low: coverage<=q_low; medium: q_low<coverage<=q_high; high: coverage>q_high",
+        "bucket_weights": bucket_weights,
+        "bucket_counts": bucket_counts,
+        "replacement": bool(coverage_cfg.replacement),
+        "num_samples": len(sample_ids),
+        "seed": int(seed),
+    }
+    return sampler, diagnostics
+
+
+def _extent_bucket_metrics_from_counts(*, tp: int, fp: int, fn: int) -> dict[str, float]:
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    denom = (2 * tp) + fp + fn
+    f1 = _safe_div(2 * tp, denom)
+    return {
+        "extent_precision": precision,
+        "extent_recall": recall,
+        "extent_f1": f1,
+        "extent_precision_recall_gap": precision - recall,
+    }
+
+
+def _compute_bucket_metrics_for_split(
+    *,
+    model: Any,
+    split_dir: Path,
+    feature_mode: str,
+    run_id: str,
+    checkpoint_path: Path,
+    checkpoint_epoch: int,
+    monitored_metric_name: str,
+    monitored_metric_mode: str,
+    input_normalizer: Any | None,
+    device: str,
+    thresholds: tuple[float, ...] = (0.50, 0.55),
+    progress_enabled: bool | None = None,
+) -> dict[str, Any]:
+    if np is None:
+        raise ContractError("numpy is required for bucket metrics diagnostics.")
+    _require_torch()
+    resolved_device = torch.device(device)
+    model.to(resolved_device)
+    model.eval()
+
+    sample_ids = list_sample_ids(split_dir)
+    if len(sample_ids) == 0:
+        raise ContractError(f"Cannot compute bucket metrics: split is empty ({split_dir}).")
+
+    coverages = _compute_split_coverages(
+        split_dir=split_dir,
+        sample_ids=sample_ids,
+        progress_enabled=progress_enabled,
+        progress_desc="net_train: val coverage buckets",
+    )
+    coverage_values = np.asarray([coverages[sid] for sid in sample_ids], dtype=np.float64)
+    q33 = float(np.quantile(coverage_values, 1.0 / 3.0))
+    q66 = float(np.quantile(coverage_values, 2.0 / 3.0))
+
+    bucket_counts = {"low": 0, "medium": 0, "high": 0}
+    counts: dict[str, dict[str, dict[str, int]]] = {
+        f"{t:.2f}": {
+            "low": {"tp": 0, "fp": 0, "fn": 0},
+            "medium": {"tp": 0, "fp": 0, "fn": 0},
+            "high": {"tp": 0, "fp": 0, "fn": 0},
+        }
+        for t in thresholds
+    }
+
+    with torch.no_grad(), progress_bar(
+        total=len(sample_ids),
+        desc="net_train: eval val buckets",
+        unit="sample",
+        progress_enabled=progress_enabled,
+        leave=False,
+    ) as bar:
+        for sample_id in sample_ids:
+            sample = read_sample(split_dir, sample_id, feature_mode)
+            coverage = float(coverages[sample_id])
+            bucket = _coverage_bucket_for(coverage, q_low=q33, q_high=q66)
+            bucket_counts[bucket] += 1
+
+            valid_mask = sample["valid"] > 0
+            extent_gt = sample["extent"] > 0
+            assembled = assemble_model_input(sample["img"], sample["valid"]).astype(np.float32)
+            batch = torch.from_numpy(assembled).unsqueeze(0).to(device=resolved_device, dtype=torch.float32)
+            if input_normalizer is not None:
+                batch = input_normalizer(batch)
+            model_out = model(batch)
+            extent_logits = model_out.get("extent")
+            if not isinstance(extent_logits, torch.Tensor):
+                raise ContractError("Model output missing 'extent' tensor for bucket metrics.")
+            extent_prob = torch.sigmoid(extent_logits)[0, 0].detach().cpu().numpy()
+
+            for thr in thresholds:
+                key = f"{thr:.2f}"
+                pred = np.logical_and(extent_prob >= float(thr), valid_mask)
+                gt_pos = np.logical_and(extent_gt, valid_mask)
+                bg_valid = np.logical_and(np.logical_not(extent_gt), valid_mask)
+                tp = int(np.logical_and(pred, gt_pos).sum())
+                fp = int(np.logical_and(pred, bg_valid).sum())
+                fn = int(np.logical_and(np.logical_not(pred), gt_pos).sum())
+                counts[key][bucket]["tp"] += tp
+                counts[key][bucket]["fp"] += fp
+                counts[key][bucket]["fn"] += fn
+            bar.update(1)
+
+    bucket_metrics: dict[str, Any] = {}
+    for thr_key, by_bucket in counts.items():
+        bucket_metrics[thr_key] = {}
+        for bucket in ("low", "medium", "high"):
+            tp = int(by_bucket[bucket]["tp"])
+            fp = int(by_bucket[bucket]["fp"])
+            fn = int(by_bucket[bucket]["fn"])
+            metrics = _extent_bucket_metrics_from_counts(tp=tp, fp=fp, fn=fn)
+            bucket_metrics[thr_key][bucket] = {
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                **metrics,
+            }
+
+    return {
+        "schema_name": "net_train.bucket_metrics_split",
+        "schema_version": "v1",
+        "run_id": run_id,
+        "split": "val",
+        "feature_mode": feature_mode,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_epoch": int(checkpoint_epoch),
+        "monitored_metric_name": monitored_metric_name,
+        "monitored_metric_mode": monitored_metric_mode,
+        "thresholds": [float(t) for t in thresholds],
+        "bucket_definition": {
+            "source_split": "val",
+            "source_metric": "gt_extent_coverage_with_valid_mask",
+            "rule": "low: coverage<=q33; medium: q33<coverage<=q66; high: coverage>q66",
+            "q33": q33,
+            "q66": q66,
+        },
+        "bucket_counts": bucket_counts,
+        "metrics": bucket_metrics,
+    }
 
 
 def _extract_float(summary: dict[str, Any], key: str, *, context: str) -> float:
@@ -796,13 +1099,21 @@ def run_train_baseline(
 
     _set_global_seed(config.training.seed)
 
+    coverage_sampling_cfg = _resolve_coverage_aware_sampling_config(config.training)
+    train_sampler, coverage_sampling_runtime = _build_coverage_aware_train_sampler(
+        split_dir=train_path,
+        seed=config.training.seed,
+        coverage_cfg=coverage_sampling_cfg,
+        progress_enabled=progress_enabled,
+    )
     train_loader = _build_dataloader(
         split_dir=train_path,
         feature_mode=config.feature_mode,
         batch_size=config.training.batch_size,
         num_workers=config.training.num_workers,
-        shuffle=True,
+        shuffle=train_sampler is None,
         augment=config.training.augment,
+        sampler=train_sampler,
     )
     val_loader = _build_dataloader(
         split_dir=val_path,
@@ -810,6 +1121,7 @@ def run_train_baseline(
         batch_size=config.training.batch_size,
         num_workers=config.training.num_workers,
         shuffle=False,
+        sampler=None,
     )
 
     model = build_model(config)
@@ -855,6 +1167,9 @@ def run_train_baseline(
                         device=resolved_device,
                         amp_enabled=amp_used,
                         aux_weight=config.loss.aux_weight,
+                        extent_aux_weight=getattr(config.loss, "extent_aux_weight", None),
+                        boundary_aux_weight=getattr(config.loss, "boundary_aux_weight", None),
+                        distance_aux_weight=getattr(config.loss, "distance_aux_weight", None),
                         gradient_clip_norm=config.training.gradient_clip,
                         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
                         progress_enabled=progress_enabled,
@@ -867,6 +1182,9 @@ def run_train_baseline(
                         device=resolved_device,
                         amp_enabled=amp_used,
                         aux_weight=config.loss.aux_weight,
+                        extent_aux_weight=getattr(config.loss, "extent_aux_weight", None),
+                        boundary_aux_weight=getattr(config.loss, "boundary_aux_weight", None),
+                        distance_aux_weight=getattr(config.loss, "distance_aux_weight", None),
                         progress_enabled=progress_enabled,
                         input_normalizer=input_normalizer,
                     )
@@ -953,6 +1271,9 @@ def run_train_baseline(
             device=resolved_device,
             amp_enabled=amp_used,
             aux_weight=config.loss.aux_weight,
+            extent_aux_weight=getattr(config.loss, "extent_aux_weight", None),
+            boundary_aux_weight=getattr(config.loss, "boundary_aux_weight", None),
+            distance_aux_weight=getattr(config.loss, "distance_aux_weight", None),
             progress_enabled=progress_enabled,
             input_normalizer=input_normalizer,
         )
@@ -974,6 +1295,9 @@ def run_train_baseline(
             device=resolved_device,
             amp_enabled=amp_used,
             aux_weight=config.loss.aux_weight,
+            extent_aux_weight=getattr(config.loss, "extent_aux_weight", None),
+            boundary_aux_weight=getattr(config.loss, "boundary_aux_weight", None),
+            distance_aux_weight=getattr(config.loss, "distance_aux_weight", None),
             progress_enabled=progress_enabled,
             input_normalizer=input_normalizer,
         )
@@ -993,6 +1317,22 @@ def run_train_baseline(
             "metrics": dict(eval_val_summary),
         },
     )
+    bucket_metrics_val = _compute_bucket_metrics_for_split(
+        model=model,
+        split_dir=val_path,
+        feature_mode=config.feature_mode,
+        run_id=run_id,
+        checkpoint_path=best_checkpoint_path,
+        checkpoint_epoch=best_epoch,
+        monitored_metric_name=resolved_metric_name,
+        monitored_metric_mode=resolved_metric_mode,
+        input_normalizer=input_normalizer,
+        device=resolved_device,
+        thresholds=(0.50, 0.55),
+        progress_enabled=progress_enabled,
+    )
+    bucket_metrics_val_path = run_path / "bucket_metrics_val.json"
+    _write_json(bucket_metrics_val_path, bucket_metrics_val)
 
     export_artifacts: NetTrainExportArtifacts = export_training_artifacts(
         run_dir=run_path,
@@ -1017,6 +1357,9 @@ def run_train_baseline(
         val_summary=val_summary,
         eval_val_summary=eval_val_summary,
         eval_val_path=eval_val_path,
+        bucket_metrics_val_summary=bucket_metrics_val,
+        bucket_metrics_val_path=bucket_metrics_val_path,
+        coverage_aware_sampling=coverage_sampling_runtime,
         monitored_metric_policy_note=policy_note,
         scheduler_state_dict=scheduler.state_dict(),
         scheduler_step_policy=scheduler_step_policy,
@@ -1041,6 +1384,7 @@ def run_train_baseline(
         config_used_path=export_artifacts.config_used_path,
         history_path=history_path,
         eval_val_path=eval_val_path,
+        bucket_metrics_val_path=bucket_metrics_val_path,
         epochs_completed=epochs,
         best_metric_name=resolved_metric_name,
         best_metric_value=best_metric_value,

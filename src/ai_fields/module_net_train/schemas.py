@@ -16,9 +16,10 @@ Rules that code elsewhere may not override:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Real
-from typing import Optional
+from typing import ClassVar, Optional
 
 from ai_fields.common.constants import FEATURE_MODES
 from ai_fields.common.errors import (
@@ -116,7 +117,24 @@ class LossConfig:
     """Weight for the distance regression loss.  Baseline v1: 1.0."""
 
     aux_weight: float = 0.4
-    """Weight applied to each deep supervision auxiliary output (0.3–0.5 recommended)."""
+    """Weight applied to each deep supervision auxiliary output (0.3–0.5 recommended).
+    Value 0.0 is allowed for explicit auxiliary-supervision ablations.
+    """
+
+    extent_aux_weight: Optional[float] = None
+    """Optional per-head aux weight override for extent.
+    When null, falls back to aux_weight.
+    """
+
+    boundary_aux_weight: Optional[float] = None
+    """Optional per-head aux weight override for boundary.
+    When null, falls back to aux_weight.
+    """
+
+    distance_aux_weight: Optional[float] = None
+    """Optional per-head aux weight override for distance.
+    When null, falls back to aux_weight.
+    """
 
     boundary_lambda_skel_dice: float = 0.5
     """Weight for the soft Dice skeleton term within boundary loss.
@@ -124,10 +142,30 @@ class LossConfig:
       boundary_loss = focal_CE_boundary + boundary_lambda_skel_dice * soft_dice_skeleton
     """
 
+    extent_focal_alpha: float = 0.25
+    """Foreground balance weight in the focal BCE component of the extent loss.
+    Baseline v1: 0.25 (background receives 3× more gradient than foreground).
+    alpha=0.50 (symmetric): foreground and background receive equal gradient weight.
+    Valid range: (0.0, 1.0) exclusive.
+    Only used when extent_loss_mode == "current".
+    """
+
+    extent_loss_mode: str = "current"
+    """Extent loss computation mode.  Controls which loss formula is used for the extent head.
+    Accepted values:
+      "current"         — focal BCE (alpha, gamma) + soft Dice.  Baseline v1.
+      "legacy_bce_dice" — plain (non-focal) BCE + soft Dice, equal weights on valid pixels.
+                          Matches the old model's extent_loss() in my_project/.
+    Changing this is an experiment-level ablation; do not change without updating the
+    train manifest (export.py records extent_loss_mode under the loss section).
+    """
+
+    # Accepted extent loss modes.  ClassVar so dataclass does not treat it as a field.
+    _ACCEPTED_EXTENT_LOSS_MODES: ClassVar[frozenset] = frozenset({"current", "legacy_bce_dice"})
+
     def validate(self) -> None:
         for attr in (
-            "extent_weight", "boundary_weight", "distance_weight",
-            "aux_weight", "boundary_lambda_skel_dice",
+            "extent_weight", "boundary_weight", "distance_weight", "boundary_lambda_skel_dice"
         ):
             val = getattr(self, attr)
             if isinstance(val, bool) or not isinstance(val, Real):
@@ -139,6 +177,46 @@ class LossConfig:
                     f"loss.{attr} must be > 0, got {val}.  "
                     "All loss weights must be positive (module_net_train.md §8.6)."
                 )
+        aux_val = self.aux_weight
+        if isinstance(aux_val, bool) or not isinstance(aux_val, Real):
+            raise ContractError(
+                f"loss.aux_weight must be a number, got {type(aux_val).__name__}."
+            )
+        if aux_val < 0:
+            raise ContractError(
+                f"loss.aux_weight must be >= 0, got {aux_val}.  "
+                "Use 0.0 only for explicit deep-supervision ablations."
+            )
+        for attr in ("extent_aux_weight", "boundary_aux_weight", "distance_aux_weight"):
+            val = getattr(self, attr)
+            if val is None:
+                continue
+            if isinstance(val, bool) or not isinstance(val, Real):
+                raise ContractError(
+                    f"loss.{attr} must be a number or null, got {type(val).__name__}."
+                )
+            if val < 0:
+                raise ContractError(
+                    f"loss.{attr} must be >= 0 when provided, got {val}."
+                )
+        val = self.extent_focal_alpha
+        if isinstance(val, bool) or not isinstance(val, Real):
+            raise ContractError(
+                f"loss.extent_focal_alpha must be a number, got {type(val).__name__}."
+            )
+        if not (0.0 < float(val) < 1.0):
+            raise ContractError(
+                f"loss.extent_focal_alpha must be in (0, 1) exclusive, got {val}."
+            )
+        if not isinstance(self.extent_loss_mode, str):
+            raise ContractError(
+                f"loss.extent_loss_mode must be a string, got {type(self.extent_loss_mode).__name__}."
+            )
+        if self.extent_loss_mode not in self._ACCEPTED_EXTENT_LOSS_MODES:
+            raise ContractError(
+                f"loss.extent_loss_mode '{self.extent_loss_mode}' is not accepted.  "
+                f"Accepted values: {sorted(self._ACCEPTED_EXTENT_LOSS_MODES)}."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +319,82 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True)
+class CoverageAwareSamplingConfig:
+    """Optional train-split sampling policy that reweights extent-coverage buckets.
+
+    The policy is train-only and does not modify dataset contents, validation
+    sampling, or any model/loss contract. It is disabled by default.
+    """
+
+    enabled: bool = False
+    """Enable extent-coverage-aware weighted sampling on train split only."""
+
+    coverage_quantile_low: float = 1.0 / 3.0
+    """Lower quantile boundary for low/medium bucket split."""
+
+    coverage_quantile_high: float = 2.0 / 3.0
+    """Upper quantile boundary for medium/high bucket split."""
+
+    bucket_weights: Mapping[str, float] = field(
+        default_factory=lambda: {"low": 1.0, "medium": 1.0, "high": 1.0}
+    )
+    """Sampling weights per coverage bucket: low, medium, high."""
+
+    replacement: bool = True
+    """WeightedRandomSampler replacement policy (baseline: True)."""
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ContractError(
+                f"training.coverage_aware_sampling.enabled must be a boolean, "
+                f"got {type(self.enabled).__name__}."
+            )
+        for attr in ("coverage_quantile_low", "coverage_quantile_high"):
+            val = getattr(self, attr)
+            if isinstance(val, bool) or not isinstance(val, Real):
+                raise ContractError(
+                    f"training.coverage_aware_sampling.{attr} must be numeric, "
+                    f"got {type(val).__name__}."
+                )
+        q_low = float(self.coverage_quantile_low)
+        q_high = float(self.coverage_quantile_high)
+        if not (0.0 < q_low < q_high < 1.0):
+            raise ContractError(
+                "training.coverage_aware_sampling quantiles must satisfy "
+                f"0 < low < high < 1, got low={q_low}, high={q_high}."
+            )
+
+        if not isinstance(self.bucket_weights, Mapping):
+            raise ContractError(
+                "training.coverage_aware_sampling.bucket_weights must be a mapping."
+            )
+        expected_keys = {"low", "medium", "high"}
+        keys = set(self.bucket_weights.keys())
+        if keys != expected_keys:
+            raise ContractError(
+                "training.coverage_aware_sampling.bucket_weights must contain exactly "
+                f"{sorted(expected_keys)}, got {sorted(keys)}."
+            )
+        for key in ("low", "medium", "high"):
+            val = self.bucket_weights.get(key)
+            if isinstance(val, bool) or not isinstance(val, Real):
+                raise ContractError(
+                    "training.coverage_aware_sampling.bucket_weights values must be numeric, "
+                    f"got {type(val).__name__} for key '{key}'."
+                )
+            if float(val) <= 0:
+                raise ContractError(
+                    f"training.coverage_aware_sampling.bucket_weights['{key}'] "
+                    f"must be > 0, got {val}."
+                )
+
+        if not isinstance(self.replacement, bool):
+            raise ContractError(
+                "training.coverage_aware_sampling.replacement must be a boolean."
+            )
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Training loop runtime configuration.
 
@@ -277,6 +431,14 @@ class TrainingConfig:
     """Enable spatial augmentation on the training split (module_net_train.md §11.2).
     When True, horizontal/vertical flips and 90° rotations are applied.
     Must be True/False; defaults to True for baseline training."""
+
+    coverage_aware_sampling: CoverageAwareSamplingConfig | Mapping[str, object] = field(
+        default_factory=CoverageAwareSamplingConfig
+    )
+    """Optional train-only coverage-bucket weighted sampling policy.
+    Accepts CoverageAwareSamplingConfig or an equivalent mapping loaded from YAML.
+    Disabled by default to preserve baseline behavior.
+    """
 
     def validate(self) -> None:
         for int_attr in ("batch_size", "num_epochs", "seed", "num_workers", "gradient_accumulation_steps"):
@@ -315,6 +477,16 @@ class TrainingConfig:
         if not isinstance(self.augment, bool):
             raise ContractError(
                 f"training.augment must be a boolean, got {type(self.augment).__name__}."
+            )
+        coverage_cfg = self.coverage_aware_sampling
+        if isinstance(coverage_cfg, CoverageAwareSamplingConfig):
+            coverage_cfg.validate()
+        elif isinstance(coverage_cfg, Mapping):
+            CoverageAwareSamplingConfig(**dict(coverage_cfg)).validate()
+        else:
+            raise ContractError(
+                "training.coverage_aware_sampling must be a mapping/object or "
+                "CoverageAwareSamplingConfig."
             )
 
 

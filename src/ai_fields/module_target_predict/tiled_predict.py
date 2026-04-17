@@ -62,7 +62,10 @@ class TiledPredictResult:
     """Result of Gaussian-blended tiled inference over a full scene."""
 
     extent_prob: np.ndarray      # (H, W) float32, range [0, 1]
-    boundary_prob: np.ndarray    # (3, H, W) float32, per-class probs summing to 1 per pixel
+    boundary_prob: np.ndarray    # (H, W) float32 — P(any boundary) = 1 − P(background).
+    # Computed as 1 − softmax[:,0,:,:] after the 3-class boundary head.
+    # Covers both skeleton (class 1) and buffer (class 2) pixels.
+    # Single-channel per DATA_CONTRACT.md §16.1 (boundary_prob.tif canonical name).
     distance_pred: np.ndarray    # (H, W) float32
     valid_mask: np.ndarray       # (H, W) uint8, values 0/1
 
@@ -252,8 +255,8 @@ def _accumulator_bytes_required(
     width: int,
     dtype: np.dtype[Any] = np.dtype(np.float32),
 ) -> int:
-    # extent_acc + boundary_acc(3 bands) + distance_acc + weight_sum = 6 planes
-    plane_count = 6
+    # extent_acc + boundary_acc(1 band, P(any_boundary)) + distance_acc + weight_sum = 4 planes
+    plane_count = 4
     return int(height * width * plane_count * dtype.itemsize)
 
 
@@ -299,10 +302,9 @@ def _finalize_weighted_outputs_in_place(
         np.divide(distance_chunk, weights, out=distance_chunk, where=positive)
         distance_chunk[non_positive] = 0.0
 
-        for cls_idx in range(boundary_acc.shape[0]):
-            boundary_chunk = boundary_acc[cls_idx, row_off:row_end, :]
-            np.divide(boundary_chunk, weights, out=boundary_chunk, where=positive)
-            boundary_chunk[non_positive] = 0.0
+        boundary_chunk = boundary_acc[row_off:row_end, :]
+        np.divide(boundary_chunk, weights, out=boundary_chunk, where=positive)
+        boundary_chunk[non_positive] = 0.0
 
 
 def cleanup_tiled_predict_result(result: TiledPredictResult) -> None:
@@ -594,7 +596,7 @@ def run_tiled_predict(
             path=temp_dir / "extent_acc.f32.mmap",
         )
         boundary_acc = _allocate_zero_array(
-            shape=(3, H, W),
+            shape=(H, W),
             dtype=accum_dtype,
             use_memmap=True,
             path=temp_dir / "boundary_acc.f32.mmap",
@@ -618,7 +620,7 @@ def run_tiled_predict(
             use_memmap=False,
         )
         boundary_acc = _allocate_zero_array(
-            shape=(3, H, W),
+            shape=(H, W),
             dtype=accum_dtype,
             use_memmap=False,
         )
@@ -716,8 +718,14 @@ def run_tiled_predict(
 
                         # Apply activations.
                         extent_t = torch.sigmoid(outputs["extent"]).squeeze(0).squeeze(0)  # (T, T)
-                        boundary_t = torch.softmax(outputs["boundary"], dim=1).squeeze(0)  # (3, T, T)
-                        distance_t = outputs["distance"].squeeze(0).squeeze(0)             # (T, T)
+                        # Reduce 3-class boundary softmax to single-channel P(any boundary).
+                        # P(any_boundary) = 1 − P(background) = P(skeleton) + P(buffer).
+                        # This gives downstream postprocess a single clear boundary signal
+                        # covering both thin skeleton and buffer zones.
+                        # DATA_CONTRACT.md §16.1: boundary_prob.tif is a single-channel raster.
+                        boundary_softmax = torch.softmax(outputs["boundary"], dim=1).squeeze(0)  # (3, T, T)
+                        boundary_t = 1.0 - boundary_softmax[0]                                  # (T, T)
+                        distance_t = outputs["distance"].squeeze(0).squeeze(0)                  # (T, T)
 
                         # Crop padded output back to actual tile dimensions.
                         extent_np = extent_t.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -725,7 +733,7 @@ def run_tiled_predict(
                         distance_np = distance_t.detach().cpu().numpy().astype(np.float32, copy=False)
 
                         extent_np = extent_np[:actual_h, :actual_w]
-                        boundary_np = boundary_np[:, :actual_h, :actual_w]
+                        boundary_np = boundary_np[:actual_h, :actual_w]
                         distance_np = distance_np[:actual_h, :actual_w]
 
                         # Gaussian weight × valid_tile for this tile region.
@@ -737,7 +745,7 @@ def run_tiled_predict(
                         sl_c = slice(col_off, col_off + actual_w)
 
                         extent_acc[sl_r, sl_c] += extent_np * weights
-                        boundary_acc[:, sl_r, sl_c] += boundary_np * weights[np.newaxis, ...]
+                        boundary_acc[sl_r, sl_c] += boundary_np * weights
                         distance_acc[sl_r, sl_c] += distance_np * weights
                         weight_sum[sl_r, sl_c] += weights
 
